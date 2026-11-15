@@ -12,7 +12,7 @@ Library folder: ComfyUI/user/cast_library (paths in workflows are relative).
 from .cast_library import library, routes
 from .cast_library.node import NODE_ID, NODE_NAME, CastLibraryLoadImage
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 NODE_CLASS_MAPPINGS = {NODE_ID: CastLibraryLoadImage}
 NODE_DISPLAY_NAME_MAPPINGS = {NODE_ID: NODE_NAME}
