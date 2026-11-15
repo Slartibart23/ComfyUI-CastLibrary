@@ -17,6 +17,7 @@ Next to every image two optional sidecar files can exist (same stem):
 
     anna_01.png
     anna_01.mask.png    mask painted in ComfyUI's MaskEditor (white = masked)
+    anna_01.paint.png   colour painted in the MaskEditor (RGBA, drawn over the image)
     anna_01.shape.json  rectangle / freehand shape drawn in the node preview
 
 Rename or delete an image in Explorer together with its sidecars.
@@ -40,6 +41,7 @@ DEFAULT_LIBRARIES = ("Accessories", "Backgrounds")
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif")
 MASK_SUFFIX = ".mask.png"
+PAINT_SUFFIX = ".paint.png"
 SHAPE_SUFFIX = ".shape.json"
 THUMB_DIR = ".thumbs"
 THUMB_SIZE = 320
@@ -114,11 +116,20 @@ def to_rel(full: str) -> str:
 
 def is_image_name(name: str) -> bool:
     low = name.lower()
-    return low.endswith(IMAGE_EXTENSIONS) and not low.endswith(MASK_SUFFIX) and not name.startswith(".")
+    return (low.endswith(IMAGE_EXTENSIONS) and not low.endswith((MASK_SUFFIX, PAINT_SUFFIX))
+            and not name.startswith("."))
 
 
 def mask_path(image_full: str) -> str:
     return os.path.splitext(image_full)[0] + MASK_SUFFIX
+
+
+def paint_path(image_full: str) -> str:
+    return os.path.splitext(image_full)[0] + PAINT_SUFFIX
+
+
+def _mtime(path: str) -> int:
+    return int(os.stat(path).st_mtime_ns) if os.path.isfile(path) else 0
 
 
 def shape_path(image_full: str) -> str:
@@ -208,14 +219,13 @@ def tree() -> dict:
 
 def image_info(full: str) -> dict:
     st = os.stat(full)
-    mp, sp = mask_path(full), shape_path(full)
-    mask_v = int(os.stat(mp).st_mtime_ns) if os.path.isfile(mp) else 0
     return {
         "name": os.path.basename(full),
         "path": to_rel(full),
         "v": f"{st.st_mtime_ns}-{st.st_size}",
-        "mask": mask_v,
-        "shape": os.path.isfile(sp),
+        "mask": _mtime(mask_path(full)),
+        "paint": _mtime(paint_path(full)),
+        "shape": os.path.isfile(shape_path(full)),
     }
 
 
@@ -335,6 +345,18 @@ def load_mask(image_full: str, size: Tuple[int, int]) -> Optional[Image.Image]:
         return m
 
 
+def load_paint(image_full: str, size: Tuple[int, int]) -> Optional[Image.Image]:
+    """The colour painted in the MaskEditor as 'RGBA' image at ``size``, or None."""
+    pp = paint_path(image_full)
+    if not os.path.isfile(pp):
+        return None
+    with Image.open(pp) as p:
+        p = p.convert("RGBA")
+        if p.size != size:
+            p = p.resize(size, Image.Resampling.BILINEAR)
+        return p
+
+
 def read_shape(image_full: str) -> dict:
     sp = shape_path(image_full)
     if not os.path.isfile(sp):
@@ -369,11 +391,18 @@ def delete_mask(image_full: str) -> None:
         os.remove(mp)
 
 
+def delete_paint(image_full: str) -> None:
+    pp = paint_path(image_full)
+    if os.path.isfile(pp):
+        os.remove(pp)
+
+
 def thumbnail(rel: str) -> str:
     """Path of a cached JPEG thumbnail of a library image."""
     full = image_file(rel)
     st = os.stat(full)
-    key = hashlib.sha1(f"{to_rel(full)}|{st.st_mtime_ns}|{st.st_size}|{THUMB_SIZE}".encode("utf-8")).hexdigest()
+    paint_v = _mtime(paint_path(full))
+    key = hashlib.sha1(f"{to_rel(full)}|{st.st_mtime_ns}|{st.st_size}|{paint_v}|{THUMB_SIZE}".encode("utf-8")).hexdigest()
     folder = os.path.join(ensure_root(), THUMB_DIR)
     target = os.path.join(folder, key + ".jpg")
     if os.path.isfile(target):
@@ -382,6 +411,9 @@ def thumbnail(rel: str) -> str:
     if sys.platform == "win32":
         _hide_on_windows(folder)
     rgb, alpha = open_rgb_alpha(full)
+    paint = load_paint(full, rgb.size) if paint_v else None
+    if paint is not None:
+        rgb = Image.alpha_composite(rgb.convert("RGBA"), paint).convert("RGB")
     if alpha is not None:
         bg = Image.new("RGB", rgb.size, (40, 40, 40))
         bg.paste(rgb, mask=alpha)
@@ -404,41 +436,69 @@ def _hide_on_windows(path: str) -> None:
 # ----------------------------------------------------------------------
 # ComfyUI MaskEditor bridge
 # ----------------------------------------------------------------------
-# The MaskEditor only reads images through ComfyUI's /view route (input,
-# output, temp). For a library image we write an RGBA copy into
-# temp/cast_library whose alpha carries the stored mask (MaskEditor
-# convention: transparent = masked). After saving, the MaskEditor uploads
-# input/clipspace/clipspace-mask-<ts>.png; its alpha is turned back into the
-# sidecar mask next to the library image.
+# The MaskEditor only reads images through ComfyUI's /view route. For a
+# library image the node points it at input/cast_library/
+# clipspace-painted-masked-<n>.png. For files named like that the MaskEditor
+# also loads clipspace-mask-<n>.png (image + mask in the alpha channel,
+# transparent = masked) and clipspace-paint-<n>.png (the colour layer) from the
+# same folder, so a stored mask and stored paint come back for editing.
+# After saving, the MaskEditor uploads new clipspace-mask-<ts>.png and
+# clipspace-paint-<ts>.png to input/; they become the sidecar files
+# <name>.mask.png and <name>.paint.png next to the library image.
+
+def _save_png(img: Image.Image, target: str) -> None:
+    tmp = target + ".tmp.png"
+    img.save(tmp, "PNG", compress_level=1)
+    os.replace(tmp, target)
+
+
+def _cleanup_editor_folder(folder: str, keep_days: float = 2.0) -> None:
+    import time
+    limit = time.time() - keep_days * 86400
+    try:
+        for n in os.listdir(folder):
+            p = os.path.join(folder, n)
+            if n.startswith("clipspace-") and os.path.isfile(p) and os.path.getmtime(p) < limit:
+                os.remove(p)
+    except OSError:
+        pass
+
 
 def mask_editor_source(rel: str) -> dict:
     import folder_paths
     full = image_file(rel)
     st = os.stat(full)
-    mp = mask_path(full)
-    mask_v = os.stat(mp).st_mtime_ns if os.path.isfile(mp) else 0
-    key = hashlib.sha1(f"{to_rel(full)}|{st.st_mtime_ns}|{st.st_size}|{mask_v}".encode("utf-8")).hexdigest()[:24]
-    folder = os.path.join(folder_paths.get_temp_directory(), MASK_EDITOR_SUBFOLDER)
-    name = f"{key}.png"
-    target = os.path.join(folder, name)
-    if not os.path.isfile(target):
+    key = hashlib.sha1(
+        f"{to_rel(full)}|{st.st_mtime_ns}|{st.st_size}|{_mtime(mask_path(full))}|{_mtime(paint_path(full))}"
+        .encode("utf-8")).hexdigest()
+    n = int(key[:13], 16)  # digits only: the MaskEditor parses the number
+    folder = os.path.join(folder_paths.get_input_directory(), MASK_EDITOR_SUBFOLDER)
+    names = {k: f"clipspace-{k}-{n}.png" for k in ("mask", "paint", "painted-masked")}
+    if not all(os.path.isfile(os.path.join(folder, v)) for v in names.values()):
         os.makedirs(folder, exist_ok=True)
+        _cleanup_editor_folder(folder)
         rgb, alpha = open_rgb_alpha(full)
         mask = load_mask(full, rgb.size)
         if mask is not None:
             alpha = Image.fromarray(255 - np.asarray(mask, dtype=np.uint8))
         elif alpha is None:
             alpha = Image.new("L", rgb.size, 255)
-        rgba = rgb.copy()
-        rgba.putalpha(alpha)
-        tmp = target + ".tmp.png"
-        rgba.save(tmp, "PNG", compress_level=1)
-        os.replace(tmp, target)
-    return {"filename": name, "subfolder": MASK_EDITOR_SUBFOLDER, "type": "temp"}
+        paint = load_paint(full, rgb.size) or Image.new("RGBA", rgb.size, (0, 0, 0, 0))
+        masked = rgb.copy()
+        masked.putalpha(alpha)
+        painted = Image.alpha_composite(rgb.convert("RGBA"), paint)
+        painted.putalpha(alpha)
+        _save_png(masked, os.path.join(folder, names["mask"]))
+        _save_png(paint, os.path.join(folder, names["paint"]))
+        _save_png(painted, os.path.join(folder, names["painted-masked"]))
+    return {"filename": names["painted-masked"], "subfolder": MASK_EDITOR_SUBFOLDER, "type": "input"}
 
 
-def import_mask_editor_result(rel: str, painted_filename: str, subfolder: str = "clipspace") -> bool:
-    """Store the MaskEditor mask as sidecar. Returns True if a mask was kept (False: empty, removed)."""
+def import_mask_editor_result(rel: str, painted_filename: str, subfolder: str = "clipspace") -> dict:
+    """
+    Store the MaskEditor result as sidecar files (mask and colour layer).
+    Returns {"mask": bool, "paint": bool}: whether each one is kept (empty ones are removed).
+    """
     import folder_paths
     full = image_file(rel)
     m = _CLIPSPACE_PAINTED.match(painted_filename or "")
@@ -446,24 +506,37 @@ def import_mask_editor_result(rel: str, painted_filename: str, subfolder: str = 
     # frontend 1.55 uploads the layers to input/ itself, older ones to input/clipspace
     if not m or sub not in ("", "clipspace"):
         raise LibraryError(f"Unexpected MaskEditor file: {sub}/{painted_filename}")
-    src = os.path.join(folder_paths.get_input_directory(), sub, f"clipspace-mask-{m.group(1)}.png")
+    base = os.path.join(folder_paths.get_input_directory(), sub)
+    src = os.path.join(base, f"clipspace-mask-{m.group(1)}.png")
     if not os.path.isfile(src):
         raise LibraryError(f"MaskEditor mask not found: {src}")
-    with Image.open(src) as im:
-        alpha = im.convert("RGBA").getchannel("A")
-    mask = 255 - np.asarray(alpha, dtype=np.uint8)
     with Image.open(full) as orig:
         size = ImageOps.exif_transpose(orig).size
-    mask_img = Image.fromarray(mask, "L")
+
+    with Image.open(src) as im:
+        alpha = im.convert("RGBA").getchannel("A")
+    mask_img = Image.fromarray(255 - np.asarray(alpha, dtype=np.uint8), "L")
     if mask_img.size != size:
         mask_img = mask_img.resize(size, Image.Resampling.BILINEAR)
-    if not np.asarray(mask_img).any():
+    has_mask = bool(np.asarray(mask_img).any())
+    if has_mask:
+        _save_png(mask_img, mask_path(full))
+    else:
         delete_mask(full)
-        return False
-    tmp = mask_path(full) + ".tmp"
-    mask_img.save(tmp, "PNG")
-    os.replace(tmp, mask_path(full))
-    return True
+
+    has_paint = False
+    paint_src = os.path.join(base, f"clipspace-paint-{m.group(1)}.png")
+    if os.path.isfile(paint_src):
+        with Image.open(paint_src) as p:
+            paint = p.convert("RGBA")
+        if paint.size != size:
+            paint = paint.resize(size, Image.Resampling.BILINEAR)
+        has_paint = bool(np.asarray(paint.getchannel("A")).any())
+        if has_paint:
+            _save_png(paint, paint_path(full))
+        else:
+            delete_paint(full)
+    return {"mask": has_mask, "paint": has_paint}
 
 
 # ----------------------------------------------------------------------

@@ -123,10 +123,12 @@ function setupNode(node) {
     else data.strokes = [];
     save();
   });
-  const maskEditBtn = button("Mask Editor", "Paint the mask in ComfyUI's MaskEditor; it is stored with the library image", () => openMaskEditor());
-  const maskDelBtn = button("Remove mask", "Delete the stored MaskEditor mask of this image", () => removeMask());
+  const maskEditBtn = button("Mask Editor", "Paint a mask or colour in ComfyUI's MaskEditor; both are stored with the library image. " +
+    "Colour is drawn into the output image in every mask_source mode", () => openMaskEditor());
+  const maskDelBtn = button("Remove mask", "Delete the stored MaskEditor mask of this image", () => removeSidecar("mask"));
+  const paintDelBtn = button("Remove paint", "Delete the colour painted in the MaskEditor for this image", () => removeSidecar("paint"));
   const modeHint = el("span", "font:11px sans-serif;color:var(--descrip-text,#999);");
-  bar.append(toolButtons, clearBtn, maskEditBtn, maskDelBtn, modeHint);
+  bar.append(toolButtons, clearBtn, maskEditBtn, maskDelBtn, paintDelBtn, modeHint);
 
   function setTool(t) {
     tool = t;
@@ -152,6 +154,7 @@ function setupNode(node) {
   let current = null;       // { path, v, mask, shape } of the loaded library image
   let img = null;           // HTMLImageElement of that image
   let maskOverlay = null;   // red canvas of the stored MaskEditor mask
+  let paintLayer = null;    // colour painted in the MaskEditor (part of the output image)
   let message = "";
   let loadToken = 0;
   let wantedPath = null;    // path of the latest load request
@@ -252,7 +255,7 @@ function setupNode(node) {
     wantedPath = path;
     const token = ++loadToken;
     if (!path) {
-      current = null; img = null; maskOverlay = null; meRef = null;
+      current = null; img = null; maskOverlay = null; paintLayer = null; meRef = null;
       message = "No image – click 🖼 Gallery";
       info.textContent = "";
       setNodeImages(null);
@@ -263,7 +266,7 @@ function setupNode(node) {
       const inf = await getJSON("/info", { path });
       if (token !== loadToken) return;
       const sameImage = current?.path === path && current?.v === inf.v && img;
-      current = { path, v: inf.v, mask: inf.mask, shape: inf.shape };
+      current = { path, v: inf.v, mask: inf.mask, paint: inf.paint, shape: inf.shape };
       if (pendingShape) {
         pendingShape = null;
         data = parseData(inf.shape_data);
@@ -281,11 +284,12 @@ function setupNode(node) {
       info.textContent = `${lib}${area ? " › " + area : ""} › ${baseOf(path)}  ${img.naturalWidth}×${img.naturalHeight}${scaled}`;
       info.title = path;
       await loadMaskOverlay(token);
+      await loadPaintLayer(token);
       await prepareMaskEditor();
     } catch (e) {
       if (token !== loadToken) return;
-      current = { path, v: "", mask: 0, shape: false };
-      img = null; maskOverlay = null;
+      current = { path, v: "", mask: 0, paint: 0, shape: false };
+      img = null; maskOverlay = null; paintLayer = null;
       message = String(e.message || e);
       info.textContent = path;
       setNodeImages(null);
@@ -321,11 +325,23 @@ function setupNode(node) {
     }
   }
 
+  async function loadPaintLayer(token) {
+    paintLayer = null;
+    if (!current?.paint || !img) return;
+    try {
+      const p = await fetchImage(libUrl("/paint", { path: current.path, v: current.paint }));
+      if (token === loadToken) paintLayer = p;
+    } catch {
+      paintLayer = null;
+    }
+  }
+
   // ---------------------------------------------------------- MaskEditor
   // The MaskEditor reads node.images / node.imgs through ComfyUI's /view
-  // route, so it gets a temp RGBA copy whose alpha carries the stored mask.
-  // After saving it points node.images at input/clipspace/…; that result is
-  // imported into <image>.mask.png and the temp copy is shown again.
+  // route. It gets input/cast_library/clipspace-painted-masked-<n>.png, and
+  // with it the stored mask and colour layer (see library.py). After saving
+  // it points node.images at its own new clipspace files; those are imported
+  // into <image>.mask.png / <image>.paint.png and our source is shown again.
   function setNodeImages(ref) {
     if (!ref) {
       node.images = undefined;
@@ -368,23 +384,22 @@ function setupNode(node) {
     if (!path) return;
     try {
       const res = await postJSON("/mask_editor/import", { path, filename: ref.filename, subfolder: ref.subfolder || "" });
-      notify(res.mask ? "Mask stored with the library image" : "Empty mask: stored mask removed", "success");
-      if (W("mask_source") && mode() !== "MaskEditor") {
-        W("mask_source").value = "MaskEditor";
-        W("mask_source").callback?.("MaskEditor");
-      }
+      const parts = [];
+      if (res.mask) parts.push(mode() === "MaskEditor" ? "mask" : "mask (used with mask_source = MaskEditor)");
+      if (res.paint) parts.push("colour (part of the output image)");
+      notify(parts.length ? `Stored with the library image: ${parts.join(", ")}` : "Nothing painted: stored mask and colour removed", "success");
     } catch (e) {
-      notify(`Mask could not be stored: ${e.message}`);
+      notify(`MaskEditor result could not be stored: ${e.message}`);
     }
     await loadCurrent(true);
     app.graph?.setDirtyCanvas(true, true);
   }
 
-  async function removeMask() {
+  async function removeSidecar(kind) {
     if (!current?.path) return;
     try {
-      await postJSON("/mask/delete", { path: current.path });
-      notify("Mask removed", "success");
+      await postJSON(`/${kind}/delete`, { path: current.path });
+      notify(kind === "mask" ? "Mask removed" : "Colour removed", "success");
     } catch (e) {
       notify(e.message);
     }
@@ -393,7 +408,9 @@ function setupNode(node) {
 
   function watchNodeImages() {
     const ref = node.images?.[0];
-    if (ref && CLIPSPACE_RESULT.test(ref.filename || "") && ref.filename !== lastImported) {
+    // our own source has the same name pattern but lives in input/cast_library
+    if (ref && CLIPSPACE_RESULT.test(ref.filename || "") && ref.subfolder !== meRef?.subfolder &&
+        ref.filename !== lastImported) {
       lastImported = ref.filename;
       importMaskEditorResult(ref);
       return;
@@ -504,8 +521,9 @@ function setupNode(node) {
     const m = mode();
     toolButtons.style.display = m === "freehand" ? "inline-flex" : "none";
     clearBtn.style.display = m === "rectangle" || m === "freehand" ? "" : "none";
-    maskEditBtn.style.display = m === "MaskEditor" && img ? "" : "none";
+    maskEditBtn.style.display = img ? "" : "none";
     maskDelBtn.style.display = m === "MaskEditor" && current?.mask ? "" : "none";
+    paintDelBtn.style.display = current?.paint ? "" : "none";
     modeHint.textContent = {
       MaskEditor: current?.mask ? "stored mask shown in red" : "",
       rectangle: "Drag to draw, drag edges/corners to adjust",
@@ -534,6 +552,7 @@ function setupNode(node) {
     }
     ctx.imageSmoothingQuality = "high";
     ctx.drawImage(img, box.x, box.y, box.w, box.h);
+    if (paintLayer) ctx.drawImage(paintLayer, box.x, box.y, box.w, box.h);
 
     if (m === "MaskEditor" && maskOverlay) ctx.drawImage(maskOverlay, box.x, box.y, box.w, box.h);
 
@@ -794,7 +813,7 @@ function setupNode(node) {
       if (pathWidget.value && dirOf(pathWidget.value) !== node.properties.castDir) setDir(dirOf(pathWidget.value));
       loadCurrent();
     }
-    const look = `${mode()}|${W("fill_color")?.value}|${current?.mask}`;
+    const look = `${mode()}|${W("fill_color")?.value}|${current?.mask}|${current?.paint}`;
     if (changed || look !== lastLook) {
       lastLook = look;
       draw();

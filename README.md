@@ -28,9 +28,15 @@ the output size, e.g. `4000×3000 → 2048×1536`.
 `name` (person or library, e.g. `Anna`), `area` (e.g. `Face`, empty for the main
 folder of a library).
 
-Masks are kept with the image, so they come back in every workflow:
-the MaskEditor mask as `<name>.mask.png` and the rectangle or freehand shape as
-`<name>.shape.json`. The shape is also stored in the workflow.
+**Painting with colour:** in the MaskEditor, the paint brush (second tool) paints
+with a solid colour. That colour becomes part of the output image, in every
+`mask_source` mode, and is shown in the node preview. *Remove paint* deletes it again.
+
+Masks and colour are kept with the image, so they come back in every workflow (and
+for further editing in the MaskEditor): the MaskEditor mask as `<name>.mask.png`, the
+colour as `<name>.paint.png` and the rectangle or freehand shape as
+`<name>.shape.json`. The shape is also stored in the workflow. In the gallery the
+badges **M**, **P** and **S** show which of them an image has.
 
 ## Where the library lives
 
@@ -71,9 +77,9 @@ No extra Python packages are needed.
 
 * The 📂 button opens Explorer on the computer that runs ComfyUI.
 * The MaskEditor only reads images from ComfyUI's input/output/temp folders. The node
-  therefore hands it a temporary copy (in `temp/cast_library`), and after *Save* it
-  turns the result into `<name>.mask.png`. Paint layers (colour painting in the
-  MaskEditor) are not used, only the mask.
+  therefore hands it working copies (in `input/cast_library`, cleaned up after two
+  days), and after *Save* it turns the result into `<name>.mask.png` and
+  `<name>.paint.png`.
 * Tested with ComfyUI 0.41 and frontend 1.55.
 
 ## License

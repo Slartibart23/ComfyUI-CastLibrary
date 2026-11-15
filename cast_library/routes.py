@@ -100,6 +100,22 @@ def register() -> None:
             return web.json_response({"error": "no mask"}, status=404)
         return web.FileResponse(mp, headers={"Cache-Control": "no-cache"})
 
+    @routes.get(f"{PREFIX}/paint")
+    @_handler
+    async def paint(request):
+        full = lib.image_file(request.rel_url.query.get("path", ""))
+        pp = lib.paint_path(full)
+        if not os.path.isfile(pp):
+            return web.json_response({"error": "no paint"}, status=404)
+        return web.FileResponse(pp, headers={"Cache-Control": "no-cache"})
+
+    @routes.post(f"{PREFIX}/paint/delete")
+    @_handler
+    async def paint_delete(request):
+        data = await _json(request)
+        await _run(lib.delete_paint, lib.image_file(data.get("path", "")))
+        return web.json_response({"ok": True})
+
     @routes.post(f"{PREFIX}/mask/delete")
     @_handler
     async def mask_delete(request):
@@ -172,4 +188,4 @@ def register() -> None:
         data = await _json(request)
         kept = await _run(lib.import_mask_editor_result, data.get("path", ""),
                           data.get("filename", ""), data.get("subfolder", ""))
-        return web.json_response({"ok": True, "mask": kept})
+        return web.json_response({"ok": True, **kept})

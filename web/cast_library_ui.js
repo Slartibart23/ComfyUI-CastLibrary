@@ -284,12 +284,13 @@ export async function openGallery({ startDir, current, onPick, onDirChange }) {
     const im = el("img", "position:absolute;inset:0;width:100%;height:100%;object-fit:contain;");
     im.loading = "lazy";
     im.decoding = "async";
-    im.src = libUrl("/thumb", { path: img.path, v: img.v });
+    im.src = libUrl("/thumb", { path: img.path, v: img.v, p: img.paint || 0 });
     im.draggable = false;
     box.appendChild(im);
     const badges = el("div", "position:absolute;top:4px;right:4px;display:flex;gap:3px;");
     const badge = (t, tip, bg) => { const b = el("span", `font:bold 10px sans-serif;padding:1px 4px;border-radius:3px;background:${bg};color:#fff;`, t); b.title = tip; return b; };
     if (img.mask) badges.appendChild(badge("M", "Has a MaskEditor mask", "#b04a2a"));
+    if (img.paint) badges.appendChild(badge("P", "Has colour painted in the MaskEditor", "#8a3ab0"));
     if (img.shape) badges.appendChild(badge("S", "Has a rectangle / freehand shape", "#2a7db0"));
     box.appendChild(badges);
     const cap = el("div", "padding:3px 6px;font-size:11px;color:#ccc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;", img.name);

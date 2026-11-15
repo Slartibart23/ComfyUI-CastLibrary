@@ -11,6 +11,9 @@ outputs a mask:
   * freehand    the shape painted in the node preview; outside it the image is
                 filled with fill_color
 
+Colour painted with the MaskEditor's paint brush is stored next to the image
+(<name>.paint.png) and drawn into the output image in every mask_source mode.
+
 Rectangle and freehand shapes are kept in the workflow and next to the image
 (<name>.shape.json), so they come back whenever the image is picked again.
 
@@ -267,6 +270,13 @@ class CastLibraryLoadImage:
             m = torch.from_numpy(np.asarray(stored, dtype=np.float32) / 255.0)
             out_mask = m.unsqueeze(0).repeat(frames, 1, 1)
 
+        # colour painted in the MaskEditor becomes part of the image (in every mask_source mode)
+        paint = lib.load_paint(image_path, (img_w, img_h))
+        if paint is not None:
+            p = torch.from_numpy(np.asarray(paint, dtype=np.float32) / 255.0).to(out_image.device)
+            alpha = p[..., 3:4]
+            out_image = out_image * (1.0 - alpha) + p[..., :3] * alpha
+
         out_image, out_mask = self._apply_mask_source(out_image, out_mask, mask_source, crop_data, fill_color)
         out_image, out_mask = self._limit_size(out_image, out_mask)
 
@@ -292,10 +302,10 @@ class CastLibraryLoadImage:
             h = hashlib.sha256()
             with open(full, "rb") as f:
                 h.update(f.read())
-            mp = lib.mask_path(full)
-            if os.path.isfile(mp):
-                st = os.stat(mp)
-                h.update(f"|mask|{st.st_mtime_ns}|{st.st_size}".encode())
+            for kind, sidecar in (("mask", lib.mask_path(full)), ("paint", lib.paint_path(full))):
+                if os.path.isfile(sidecar):
+                    st = os.stat(sidecar)
+                    h.update(f"|{kind}|{st.st_mtime_ns}|{st.st_size}".encode())
             return h.hexdigest()
         except Exception:
             return float("nan")

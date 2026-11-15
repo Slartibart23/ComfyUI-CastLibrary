@@ -98,12 +98,17 @@ class LibraryTest(unittest.TestCase):
         lib.write_shape(full, {})
         self.assertFalse(os.path.exists(lib.shape_path(full)))
 
-        # MaskEditor source without a mask: fully opaque
+        # MaskEditor source without mask / paint: fully opaque, empty colour layer,
+        # in input/cast_library and named so that the MaskEditor loads its layers
         ref = lib.mask_editor_source(rel)
-        src = os.path.join(self.tmp, "temp", ref["subfolder"], ref["filename"])
-        self.assertEqual(Image.open(src).getchannel("A").getextrema(), (255, 255))
+        self.assertEqual((ref["subfolder"], ref["type"]), ("cast_library", "input"))
+        self.assertRegex(ref["filename"], r"^clipspace-painted-masked-\d+\.png$")
+        n = ref["filename"][len("clipspace-painted-masked-"):-4]
+        src_dir = os.path.join(self.tmp, "input", "cast_library")
+        self.assertEqual(Image.open(os.path.join(src_dir, f"clipspace-mask-{n}.png")).getchannel("A").getextrema(), (255, 255))
+        self.assertEqual(Image.open(os.path.join(src_dir, f"clipspace-paint-{n}.png")).getchannel("A").getextrema(), (0, 0))
 
-        # simulate a MaskEditor save: left half painted (alpha 0)
+        # simulate a MaskEditor save: left half masked (alpha 0), a red square painted
         clip = os.path.join(self.tmp, "input", "clipspace")
         os.makedirs(clip)
         alpha = np.full((30, 40), 255, np.uint8)
@@ -111,26 +116,52 @@ class LibraryTest(unittest.TestCase):
         rgba = Image.new("RGB", (40, 30)).convert("RGBA")
         rgba.putalpha(Image.fromarray(alpha))
         rgba.save(os.path.join(clip, "clipspace-mask-123.png"))
-        self.assertTrue(lib.import_mask_editor_result(rel, "clipspace-painted-masked-123.png"))
+        paint = Image.new("RGBA", (40, 30), (0, 0, 0, 0))
+        paint.paste((255, 0, 0, 255), (30, 0, 40, 10))
+        paint.save(os.path.join(clip, "clipspace-paint-123.png"))
+        self.assertEqual(lib.import_mask_editor_result(rel, "clipspace-painted-masked-123.png"), {"mask": True, "paint": True})
         mask = np.asarray(lib.load_mask(full, (40, 30)))
         self.assertEqual(mask[:, :20].min(), 255)
         self.assertEqual(mask[:, 20:].max(), 0)
-        self.assertTrue(lib.list_images("Accessories")[0]["mask"])
+        info = lib.list_images("Accessories")[0]
+        self.assertTrue(info["mask"] and info["paint"])
+        self.assertEqual(lib.load_paint(full, (40, 30)).getpixel((35, 5)), (255, 0, 0, 255))
+        self.assertTrue(os.path.isfile(lib.thumbnail(rel)))
 
-        # the new source carries the mask in its alpha (masked = transparent)
+        # the new source carries mask (alpha) and colour layer for re-editing
         ref2 = lib.mask_editor_source(rel)
         self.assertNotEqual(ref, ref2)
-        a2 = np.asarray(Image.open(os.path.join(self.tmp, "temp", ref2["subfolder"], ref2["filename"])).getchannel("A"))
+        n2 = ref2["filename"][len("clipspace-painted-masked-"):-4]
+        a2 = np.asarray(Image.open(os.path.join(src_dir, f"clipspace-mask-{n2}.png")).getchannel("A"))
         self.assertEqual(a2[:, :20].max(), 0)
         self.assertEqual(a2[:, 20:].min(), 255)
+        self.assertEqual(Image.open(os.path.join(src_dir, f"clipspace-paint-{n2}.png")).getpixel((35, 5)), (255, 0, 0, 255))
 
         with self.assertRaises(lib.LibraryError):
             lib.import_mask_editor_result(rel, "../evil.png")
 
-        # an empty mask removes the sidecar (frontend 1.55: layers directly in input/)
+        # empty mask and empty colour remove both sidecars (frontend 1.55: layers directly in input/)
         Image.new("RGBA", (40, 30), (0, 0, 0, 255)).save(os.path.join(self.tmp, "input", "clipspace-mask-124.png"))
-        self.assertFalse(lib.import_mask_editor_result(rel, "clipspace-painted-masked-124.png", ""))
+        Image.new("RGBA", (40, 30), (0, 0, 0, 0)).save(os.path.join(self.tmp, "input", "clipspace-paint-124.png"))
+        self.assertEqual(lib.import_mask_editor_result(rel, "clipspace-painted-masked-124.png", ""), {"mask": False, "paint": False})
         self.assertIsNone(lib.load_mask(full, (40, 30)))
+        self.assertIsNone(lib.load_paint(full, (40, 30)))
+
+    def test_paint_goes_into_output_image(self):
+        try:
+            from cast_library.node import CastLibraryLoadImage
+        except Exception as e:
+            self.skipTest(f"node import failed: {e}")
+        rel = lib.save_upload("Backgrounds", "sky.png", png_bytes((40, 30), color=(0, 0, 255, 255), mode="RGB"))
+        paint = Image.new("RGBA", (40, 30), (0, 0, 0, 0))
+        paint.paste((255, 0, 0, 255), (0, 0, 10, 10))
+        paint.paste((0, 255, 0, 128), (20, 0, 30, 10))
+        paint.save(lib.paint_path(lib.image_file(rel)))
+        for mode in ("MaskEditor", "rectangle"):
+            img, *_ = CastLibraryLoadImage().load_image(rel, False, 512, 512, False, 32, "lanczos", mode, "yellow", "")
+            self.assertEqual([round(float(v), 2) for v in img[0, 5, 5]], [1.0, 0.0, 0.0])
+            self.assertEqual([round(float(v), 2) for v in img[0, 5, 25]], [0.0, 0.5, 0.5])
+            self.assertEqual([round(float(v), 2) for v in img[0, 20, 5]], [0.0, 0.0, 1.0])
 
     def test_node_outputs(self):
         try:
