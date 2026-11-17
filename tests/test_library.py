@@ -147,6 +147,23 @@ class LibraryTest(unittest.TestCase):
         self.assertIsNone(lib.load_mask(full, (40, 30)))
         self.assertIsNone(lib.load_paint(full, (40, 30)))
 
+    def test_multi_frame_file_loads_first_frame(self):
+        try:
+            from cast_library.node import CastLibraryLoadImage
+        except Exception as e:
+            self.skipTest(f"node import failed: {e}")
+        # phone photos are MPO: a main image plus a smaller second frame
+        main = Image.new("RGB", (80, 60), (255, 0, 0))
+        extra = Image.new("RGB", (40, 30), (0, 255, 0))
+        buf = BytesIO()
+        main.save(buf, "MPO", save_all=True, append_images=[extra])
+        with Image.open(BytesIO(buf.getvalue())) as check:
+            self.assertEqual(getattr(check, "n_frames", 1), 2)
+        rel = lib.save_upload("Backgrounds", "phone.jpg", buf.getvalue())
+        img, mask, w, h, *_ = CastLibraryLoadImage().load_image(rel, False, 512, 512, False, 32, "lanczos")
+        self.assertEqual((tuple(img.shape), tuple(mask.shape), w, h), ((1, 60, 80, 3), (1, 60, 80), 80, 60))
+        self.assertGreater(float(img[0, 30, 40, 0]), 0.9)
+
     def test_paint_goes_into_output_image(self):
         try:
             from cast_library.node import CastLibraryLoadImage

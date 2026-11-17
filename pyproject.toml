@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-castlibrary"
 description = "Cast Library: an image library inside ComfyUI. Persons with face/body areas (more areas on demand), accessories, backgrounds and any library you create. Pick images in a gallery, upload by button or drag & drop, open folders in Explorer; outputs image + mask (MaskEditor mask and colour stored with the image, rectangle or freehand) with optional resize, images limited to 2048 px, plus filename, name and area."
-version = "1.1.0"
+version = "1.1.1"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = []

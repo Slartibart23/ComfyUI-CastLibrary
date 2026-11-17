@@ -34,7 +34,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageOps, ImageSequence
+from PIL import Image, ImageDraw
 
 from comfy.utils import common_upscale
 
@@ -121,16 +121,6 @@ class CastLibraryLoadImage:
     def _pil_to_tensor(pil_img: Image.Image) -> torch.Tensor:
         arr = np.array(pil_img).astype(np.float32) / 255.0
         return torch.from_numpy(arr).unsqueeze(0)
-
-    @staticmethod
-    def _alpha_to_mask(pil_img: Image.Image) -> torch.Tensor:
-        """Alpha channel as (1, H, W) mask (1 = masked); no alpha -> zeros."""
-        if "A" in pil_img.getbands():
-            mask = 1.0 - np.array(pil_img.getchannel("A")).astype(np.float32) / 255.0
-        else:
-            w, h = pil_img.size
-            mask = np.zeros((h, w), dtype=np.float32)
-        return torch.from_numpy(mask).unsqueeze(0)
 
     @staticmethod
     def limited_size(w: int, h: int) -> Tuple[int, int]:
@@ -254,21 +244,20 @@ class CastLibraryLoadImage:
         filename_stem = os.path.splitext(os.path.basename(image_path))[0]
         name, area = lib.describe(library_image)
 
-        images, masks = [], []
-        with Image.open(image_path) as img_pil:
-            for frame in ImageSequence.Iterator(img_pil):
-                frame = ImageOps.exif_transpose(frame)
-                images.append(self._pil_to_tensor(frame.convert("RGB")))
-                masks.append(self._alpha_to_mask(frame))
-        out_image = torch.cat(images, dim=0)
-        out_mask = torch.cat(masks, dim=0)
+        # first frame only, like the preview and the MaskEditor; phone photos (MPO)
+        # carry extra frames of another size
+        rgb, alpha = lib.open_rgb_alpha(image_path)
+        img_w, img_h = rgb.size
+        out_image = self._pil_to_tensor(rgb)
 
         # MaskEditor mask stored with the library image replaces the alpha mask
-        frames, img_h, img_w, _ = out_image.shape
         stored = lib.load_mask(image_path, (img_w, img_h))
         if stored is not None:
-            m = torch.from_numpy(np.asarray(stored, dtype=np.float32) / 255.0)
-            out_mask = m.unsqueeze(0).repeat(frames, 1, 1)
+            out_mask = torch.from_numpy(np.asarray(stored, dtype=np.float32) / 255.0).unsqueeze(0)
+        elif alpha is not None:
+            out_mask = 1.0 - torch.from_numpy(np.asarray(alpha, dtype=np.float32) / 255.0).unsqueeze(0)
+        else:
+            out_mask = torch.zeros((1, img_h, img_w), dtype=torch.float32)
 
         # colour painted in the MaskEditor becomes part of the image (in every mask_source mode)
         paint = lib.load_paint(image_path, (img_w, img_h))
