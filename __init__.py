@@ -1,10 +1,10 @@
 """
 ComfyUI-CastLibrary
 ===================
-An image library inside ComfyUI: persons (each with face / body areas, more
-areas on demand), accessories, backgrounds and any other library you create.
-Pick an image in the node's gallery, upload new ones, open the folder in
-Explorer, and get image + mask (MaskEditor, rectangle or freehand) + resize.
+An image library inside ComfyUI: a free folder tree (#TEMP, PERSONS,
+BACKGROUNDS, ACCESSORIES, CLOTHES, ... with any sub folders). Pick an image in
+the node's gallery, upload, move and delete images, manage the folders, and get
+image + mask (MaskEditor, rectangle or freehand) + crop + resize.
 
 Library folder: ComfyUI/user/cast_library (paths in workflows are relative).
 """
@@ -12,7 +12,7 @@ Library folder: ComfyUI/user/cast_library (paths in workflows are relative).
 from .cast_library import library, routes
 from .cast_library.node import NODE_ID, NODE_NAME, CastLibraryLoadImage
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 NODE_CLASS_MAPPINGS = {NODE_ID: CastLibraryLoadImage}
 NODE_DISPLAY_NAME_MAPPINGS = {NODE_ID: NODE_NAME}

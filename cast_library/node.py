@@ -1,9 +1,8 @@
 """
 Cast Library · Load & Resize Image
 
-Loads an image from the Cast Library (persons with face / body areas, plain
-libraries such as accessories or backgrounds), optionally resizes it and
-outputs a mask:
+Loads an image from the Cast Library (a free folder tree such as
+PERSONS/Anna/Face or BACKGROUNDS), optionally resizes it and outputs a mask:
 
   * MaskEditor  the mask painted in ComfyUI's MaskEditor, stored next to the
                 image (<name>.mask.png); without one the image's alpha channel
@@ -17,9 +16,12 @@ Colour painted with the MaskEditor's paint brush is stored next to the image
 Rectangle and freehand shapes are kept in the workflow and next to the image
 (<name>.shape.json), so they come back whenever the image is picked again.
 
-Images whose longest side is larger than MAX_SIDE (2048 px) are scaled down
-proportionally to MAX_SIDE before the optional resize; the file in the library
-stays untouched.
+With crop_to_mask on, image and mask are cropped to the bounding box of the
+mask (like KJNodes "Image Crop By Mask"); without a mask nothing is cropped.
+
+Images whose longest side is larger than MAX_SIDE (2048 px) after the crop are
+scaled down proportionally to MAX_SIDE before the optional resize; the file in
+the library stays untouched.
 
 Resize and mask logic is taken from "Load & Resize Image + Filename"
 (Slartibart23), which is based on KJNodes LoadAndResizeImage by kijai
@@ -93,24 +95,34 @@ class CastLibraryLoadImage:
                 "fill_color": (list(FILL_COLORS.keys()), {"default": "yellow",
                                                           "tooltip": "Colour for the area outside the freehand shape"}),
                 "crop_data": ("STRING", {"default": "", "tooltip": "Written by the editor in the node preview"}),
+                "crop_to_mask": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "label_on": "on",
+                        "label_off": "off",
+                        "tooltip": "Crop image and mask to the bounding box of the mask (like KJNodes Image Crop "
+                                   "By Mask), before the size limit and resize. Without a mask nothing is cropped",
+                    },
+                ),
             }
         }
 
     RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("image", "mask", "width", "height", "filename", "name", "area")
+    RETURN_NAMES = ("image", "mask", "width", "height", "filename", "folder", "folder_name")
     OUTPUT_TOOLTIPS = (
         "The library image (resized if enabled)",
         "Mask from mask_source",
         "Output width",
         "Output height",
         "File name without extension",
-        "Person or library name, e.g. 'Anna' or 'Accessories'",
-        "Area inside the library, e.g. 'Face' (empty for the library's main folder)",
+        "Folder of the image inside the library, e.g. 'PERSONS/Anna/Face'",
+        "Name of that folder, e.g. 'Face'",
     )
     FUNCTION = "load_image"
     CATEGORY = "Cast Library"
-    DESCRIPTION = ("Loads an image from your Cast Library (persons with face/body areas, accessories, "
-                   "backgrounds, ...) with resize and mask (MaskEditor, rectangle or freehand). "
+    DESCRIPTION = ("Loads an image from your Cast Library (folders such as PERSONS, BACKGROUNDS, "
+                   "ACCESSORIES, ...) with resize and mask (MaskEditor, rectangle or freehand). "
                    f"Images larger than {MAX_SIDE} px on the longest side are scaled down to {MAX_SIDE} px.")
 
     # ------------------------------------------------------------------
@@ -130,6 +142,18 @@ class CastLibraryLoadImage:
             return w, h
         scale = MAX_SIDE / longest
         return max(1, round(w * scale)), max(1, round(h * scale))
+
+    @staticmethod
+    def _crop_to_mask(image: torch.Tensor, mask: torch.Tensor):
+        """Crop to the bounding box of mask >= 0.5 (as Image Crop By Mask rounds); no mask -> unchanged."""
+        hit = mask[0] >= 0.5
+        rows = torch.where(hit.any(dim=1))[0]
+        if len(rows) == 0:
+            return image, mask
+        cols = torch.where(hit.any(dim=0))[0]
+        y0, y1 = int(rows[0]), int(rows[-1]) + 1
+        x0, x1 = int(cols[0]), int(cols[-1]) + 1
+        return image[:, y0:y1, x0:x1, :], mask[:, y0:y1, x0:x1]
 
     @classmethod
     def _limit_size(cls, image: torch.Tensor, mask: torch.Tensor):
@@ -239,10 +263,10 @@ class CastLibraryLoadImage:
     # ------------------------------------------------------------------
 
     def load_image(self, library_image, resize, width, height, keep_proportion, divisible_by,
-                   upscale_method, mask_source="MaskEditor", fill_color="yellow", crop_data=""):
+                   upscale_method, mask_source="MaskEditor", fill_color="yellow", crop_data="", crop_to_mask=True):
         image_path = lib.image_file(library_image)
         filename_stem = os.path.splitext(os.path.basename(image_path))[0]
-        name, area = lib.describe(library_image)
+        folder, folder_name = lib.describe(library_image)
 
         # first frame only, like the preview and the MaskEditor; phone photos (MPO)
         # carry extra frames of another size
@@ -267,6 +291,8 @@ class CastLibraryLoadImage:
             out_image = out_image * (1.0 - alpha) + p[..., :3] * alpha
 
         out_image, out_mask = self._apply_mask_source(out_image, out_mask, mask_source, crop_data, fill_color)
+        if crop_to_mask:
+            out_image, out_mask = self._crop_to_mask(out_image, out_mask)
         out_image, out_mask = self._limit_size(out_image, out_mask)
 
         if resize:
@@ -278,7 +304,7 @@ class CastLibraryLoadImage:
         else:
             _, final_h, final_w, _ = out_image.shape
 
-        return out_image, out_mask, final_w, final_h, filename_stem, name, area
+        return out_image, out_mask, final_w, final_h, filename_stem, folder, folder_name
 
     # ------------------------------------------------------------------
     # cache / validation

@@ -1,9 +1,11 @@
-// Cast Library: server calls, gallery window and small dialogs (shared by the node).
+// Cast Library: server calls, gallery window with folder / image management and
+// small dialogs (shared by the node).
 
 const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
 
 export const PREFIX = "/cast_library";
+const DRAG_TYPE = "application/x-cast-library";
 
 // ------------------------------------------------------------------ helpers
 export function el(tag, css, text) {
@@ -37,11 +39,13 @@ export const libUrl = (path, params) => api.apiURL(`${PREFIX}${path}?${new URLSe
 
 export const dirOf = (rel) => (rel && rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "");
 export const baseOf = (rel) => (rel ? rel.slice(rel.lastIndexOf("/") + 1) : "");
+export const folderLabel = (dir) => dir || "Cast Library";
 
 export const isImageFile = (f) =>
   /^image\//.test(f.type) || /\.(png|jpe?g|webp|bmp|tiff?|gif)$/i.test(f.name || "");
 
 export const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
+const hasItems = (e) => [...(e.dataTransfer?.types || [])].includes(DRAG_TYPE);
 
 const stop = (e) => e.stopPropagation();
 
@@ -71,24 +75,33 @@ export async function getTree(force = false) {
 }
 export const onTreeChange = (fn) => { treeListeners.add(fn); return () => treeListeners.delete(fn); };
 
-// library / area that contain a folder path
-export function findDir(tree, dir) {
-  for (const lib of tree?.libraries || []) {
-    for (const area of lib.areas) if (area.path === dir) return { lib, area };
-  }
-  for (const lib of tree?.libraries || []) {
-    if (dir === lib.path || dir.startsWith(lib.path + "/")) return { lib, area: lib.areas[0] || null };
-  }
-  return null;
+// all folders in display order: [{ path, name, count, depth, total }]
+export function flattenTree(tree) {
+  const out = [];
+  const walk = (f, depth) => {
+    const row = { path: f.path, name: f.name, count: f.count, depth, total: f.count };
+    out.push(row);
+    for (const c of f.children) row.total += walk(c, depth + 1);
+    return row.total;
+  };
+  if (tree?.tree) walk(tree.tree, 0);
+  return out;
 }
 
-export const areaLabel = (area) => `${area.name || "(main folder)"}  (${area.count})`;
+// Nodes keep library paths in their widgets; after moving or renaming they are
+// told how paths changed. remap(path) returns the new path or null.
+const moveListeners = new Set();
+export const onPathsMoved = (fn) => { moveListeners.add(fn); return () => moveListeners.delete(fn); };
+function pathsMoved(remap) {
+  moveListeners.forEach((fn) => { try { fn(remap); } catch {} });
+}
+const prefixRemap = (from, to) => (p) =>
+  p === from ? to : p.startsWith(from + "/") ? to + p.slice(from.length) : null;
 
 // ---------------------------------------------------------------- actions
 export async function uploadFiles(dir, files) {
   const images = [...files].filter(isImageFile);
   if (!images.length) throw new Error("No image files to upload.");
-  if (!dir) throw new Error("Choose a library and area first.");
   const fd = new FormData();
   fd.append("dir", dir);
   for (const f of images) fd.append("image", f, f.name);
@@ -120,7 +133,21 @@ export async function openInExplorer(path) {
   }
 }
 
-// ---------------------------------------------------------------- modal base
+async function moveImages(paths, target) {
+  const { moved } = await postJSON("/images/move", { paths, target });
+  pathsMoved((p) => moved[p] ?? null);
+  await getTree(true);
+  return Object.keys(moved).length;
+}
+
+async function moveFolder(path, target) {
+  const res = await postJSON("/folder/move", { path, target });
+  pathsMoved(prefixRemap(path, res.path));
+  await getTree(true);
+  return res.path;
+}
+
+// ---------------------------------------------------------------- dialogs
 function modal(width) {
   const overlay = el("div",
     "position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;");
@@ -133,49 +160,87 @@ function modal(width) {
   return { overlay, panel };
 }
 
-// "New person / library / area" dialog. Resolves with the created folder path or null.
-export function newEntryDialog(currentLib) {
+// small dialog; body(panel) adds the content, ok() may throw to show an error
+function dialog({ title, okLabel, danger, body, ok, focus }) {
   return new Promise((resolve) => {
-    const { overlay, panel } = modal("width:380px;padding:16px;display:flex;flex-direction:column;gap:10px;");
-    panel.appendChild(el("div", "font-weight:bold;font-size:14px;", "Create in the Cast Library"));
-    const kind = el("select", "padding:4px;background:#333;color:#ddd;border:1px solid #555;border-radius:4px;");
-    const opts = [["person", "Person (with Face + Body)"], ["library", "Library (e.g. Accessories)"]];
-    if (currentLib) opts.push(["area", `Area in "${currentLib.name}"`]);
-    for (const [v, t] of opts) kind.appendChild(Object.assign(el("option", null, t), { value: v }));
-    const name = el("input", "padding:5px;background:#111;color:#eee;border:1px solid #555;border-radius:4px;");
-    name.placeholder = "Name";
+    const { overlay, panel } = modal("width:400px;max-width:92vw;padding:16px;display:flex;flex-direction:column;gap:10px;");
+    overlay.dataset.castDialog = "1";
+    panel.appendChild(el("div", "font-weight:bold;font-size:14px;", title));
+    body?.(panel);
     const err = el("div", "color:#f77;font-size:12px;min-height:14px;");
     const row = el("div", "display:flex;justify-content:flex-end;gap:8px;");
-    const close = (v) => { overlay.remove(); resolve(v); };
-    const ok = async () => {
+    const close = (v) => { overlay.remove(); document.removeEventListener("keydown", onKey, true); resolve(v); };
+    const run = async () => {
       err.textContent = "";
-      try {
-        const body = { kind: kind.value, name: name.value };
-        if (kind.value === "area") body.library = currentLib.path;
-        const { path } = await postJSON("/create", body);
-        await getTree(true);
-        close(path);
-      } catch (e) {
-        err.textContent = e.message;
-      }
+      try { close(await ok()); } catch (e) { err.textContent = e.message; }
     };
-    row.append(button("Cancel", "", () => close(null)), button("Create", "", ok, "background:#2a6db0;"));
-    panel.append(kind, name, err, row);
-    name.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") ok();
-      if (e.key === "Escape") close(null);
-    });
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); close(null); }
+      if (e.key === "Enter") { e.stopPropagation(); e.preventDefault(); run(); }
+    };
+    document.addEventListener("keydown", onKey, true);
+    row.append(button("Cancel", "", () => close(null)), button(okLabel, "", run, danger ? "background:#a33;" : "background:#2a6db0;"));
+    panel.append(err, row);
     overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) close(null); });
-    setTimeout(() => name.focus(), 0);
+    setTimeout(() => focus?.focus(), 0);
+  });
+}
+
+function textDialog(title, value, okLabel, action) {
+  const input = el("input", "padding:5px;background:#111;color:#eee;border:1px solid #555;border-radius:4px;");
+  input.value = value || "";
+  return dialog({
+    title, okLabel, focus: input,
+    body: (p) => { p.appendChild(input); setTimeout(() => input.select(), 0); },
+    ok: () => action(input.value),
+  });
+}
+
+const confirmDialog = (title, text, okLabel) =>
+  dialog({ title, okLabel, danger: true, body: (p) => p.appendChild(el("div", "color:#ccc;line-height:1.4;", text)), ok: () => true });
+
+// choose a target folder; folders in `exclude` (and below) are not offered
+function folderDialog(tree, title, exclude) {
+  let chosen = null;
+  return dialog({
+    title, okLabel: "Move here",
+    body: (p) => {
+      const list = el("div", "max-height:50vh;overflow:auto;border:1px solid #444;border-radius:4px;padding:4px 0;");
+      for (const f of flattenTree(tree)) {
+        if (exclude && (f.path === exclude || f.path.startsWith(exclude + "/"))) continue;
+        const item = el("div", `padding:3px 10px 3px ${10 + f.depth * 14}px;cursor:pointer;white-space:nowrap;`,
+          `${f.depth ? "" : "🏠 "}${f.name}  (${f.count})`);
+        item.addEventListener("click", () => {
+          chosen = f.path;
+          list.querySelectorAll("div").forEach((d) => { d.style.background = ""; });
+          item.style.background = "#2a6db0";
+        });
+        list.appendChild(item);
+      }
+      p.appendChild(list);
+    },
+    ok: () => {
+      if (chosen == null) throw new Error("Choose a folder.");
+      return chosen;
+    },
+  });
+}
+
+// "New folder" inside `parent`; resolves with the new folder path or null
+export function newFolderDialog(parent) {
+  return textDialog(`New folder in ${folderLabel(parent)}`, "", "Create", async (name) => {
+    const { path } = await postJSON("/folder/create", { parent, name });
+    await getTree(true);
+    return path;
   });
 }
 
 // ---------------------------------------------------------------- gallery
-function loadSize() {
-  try { return Number(localStorage.getItem("CastLibrary.thumbSize")) || 150; } catch { return 150; }
+function loadPref(key, fallback) {
+  try { return JSON.parse(localStorage.getItem(`CastLibrary.${key}`)) ?? fallback; } catch { return fallback; }
 }
-function storeSize(v) {
-  try { localStorage.setItem("CastLibrary.thumbSize", String(v)); } catch {}
+function storePref(key, value) {
+  try { localStorage.setItem(`CastLibrary.${key}`, JSON.stringify(value)); } catch {}
 }
 
 /**
@@ -193,92 +258,197 @@ export async function openGallery({ startDir, current, onPick, onDirChange }) {
   const title = el("div", "font-weight:bold;font-size:14px;", "Cast Library");
   const pathLabel = el("div", "color:#aaa;flex:1 1 auto;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
   const size = el("input", "width:110px;");
-  Object.assign(size, { type: "range", min: 80, max: 320, value: loadSize(), title: "Thumbnail size" });
+  Object.assign(size, { type: "range", min: 80, max: 320, value: loadPref("thumbSize", 150), title: "Thumbnail size" });
   const bUpload = button("⬆ Upload", "Add images to the shown folder (or drop them here)", async () => doUpload(await pickFiles()));
-  const bNew = button("＋ New", "New person, library or area", async () => {
-    const path = await newEntryDialog(currentLib());
-    if (path) {
-      const t = await getTree();
-      const hit = findDir(t, path);
-      await show(hit?.area?.path ?? path);
-    }
-  });
-  const bExplorer = button("📂 Explorer", "Open the shown folder in Explorer", () => openInExplorer(dir || ""));
-  const bRefresh = button("⟳", "Reload", async () => { await getTree(true); await show(dir); });
+  const bExplorer = button("📂 Explorer", "Open the shown folder in Explorer", () => openInExplorer(dir));
+  const bRefresh = button("⟳", "Reload", () => refresh());
   const bClose = button("✕", "Close (Esc)", () => close());
-  header.append(title, pathLabel, el("span", "color:#888;font-size:11px;", "Size"), size, bUpload, bNew, bExplorer, bRefresh, bClose);
+  header.append(title, pathLabel, el("span", "color:#888;font-size:11px;", "Size"), size, bUpload, bExplorer, bRefresh, bClose);
 
-  // body
+  // body: folder tree | images
   const body = el("div", "flex:1 1 auto;display:flex;min-height:0;");
-  const side = el("div", "width:230px;flex:0 0 230px;overflow:auto;border-right:1px solid #444;padding:6px 0;");
+  const sideWrap = el("div", "width:250px;flex:0 0 250px;display:flex;flex-direction:column;border-right:1px solid #444;min-height:0;");
+  const folderBar = el("div", "display:flex;flex-wrap:wrap;gap:4px;padding:6px 8px;border-bottom:1px solid #333;");
+  const bNewFolder = button("＋ Folder", "New folder inside the shown folder", async () => {
+    const path = await newFolderDialog(dir);
+    if (path) { collapsed.delete(dir); await show(path); }
+  });
+  const bRename = button("Rename", "Rename the shown folder", async () => {
+    const res = await textDialog(`Rename "${baseOf(dir)}"`, baseOf(dir), "Rename", async (name) => {
+      const r = await postJSON("/folder/rename", { path: dir, name });
+      pathsMoved(prefixRemap(dir, r.path));
+      await getTree(true);
+      return r.path;
+    });
+    if (res) await show(res);
+  });
+  const bMoveFolder = button("Move", "Move the shown folder into another folder (or drag it in the tree)", async () => {
+    const target = await folderDialog(tree, `Move "${baseOf(dir)}" to…`, dir);
+    if (target == null) return;
+    try { await show(await moveFolder(dir, target)); } catch (e) { notify(e.message); }
+  });
+  const bDeleteFolder = button("Delete", "Move the shown folder with everything in it to the recycle bin", async () => {
+    const f = flattenTree(tree).find((x) => x.path === dir);
+    const ok = await confirmDialog(`Delete "${baseOf(dir)}"?`,
+      `The folder, its sub folders and ${f?.total ?? 0} image(s) go to the recycle bin.`, "Delete");
+    if (!ok) return;
+    try {
+      await postJSON("/folder/delete", { path: dir });
+      await getTree(true);
+      await show(dirOf(dir));
+    } catch (e) { notify(e.message); }
+  });
+  folderBar.append(bNewFolder, bRename, bMoveFolder, bDeleteFolder);
+  const side = el("div", "flex:1 1 auto;overflow:auto;padding:4px 0;");
+  sideWrap.append(folderBar, side);
+
+  const mainWrap = el("div", "flex:1 1 auto;display:flex;flex-direction:column;min-width:0;");
+  const selBar = el("div", "display:none;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid #333;background:#1d2a38;");
+  const selCount = el("span", "font-weight:bold;");
+  selBar.append(
+    selCount,
+    button("Move to…", "Move the selected images (or drag them onto a folder)", async () => {
+      if (!selected.size) return;
+      const target = await folderDialog(tree, `Move ${selected.size} image(s) to…`);
+      if (target == null) return;
+      try {
+        const n = await moveImages([...selected], target);
+        notify(`${n} image(s) moved to ${folderLabel(target)}`, "success");
+        selected.clear();
+        await show(dir);
+      } catch (e) { notify(e.message); }
+    }),
+    button("Delete", "Move the selected images to the recycle bin", async () => {
+      if (!selected.size) return;
+      const ok = await confirmDialog(`Delete ${selected.size} image(s)?`,
+        "They go to the recycle bin, together with their mask, colour and shape files.", "Delete");
+      if (!ok) return;
+      try {
+        await postJSON("/images/delete", { paths: [...selected] });
+        selected.clear();
+        await getTree(true);
+        await show(dir);
+      } catch (e) { notify(e.message); }
+    }),
+    button("Select all", "", () => { images.forEach((i) => selected.add(i.path)); renderGrid(); }),
+    button("Clear", "Clear the selection", () => { selected.clear(); renderGrid(); }),
+    el("span", "color:#9ab;font-size:11px;", "Ctrl/Shift-click selects · drag onto a folder to move"),
+  );
   const main = el("div", "flex:1 1 auto;overflow:auto;position:relative;padding:10px;");
   const grid = el("div", "display:grid;gap:10px;align-content:start;");
   const dropHint = el("div",
     "position:absolute;inset:6px;border:2px dashed #4af;border-radius:8px;background:rgba(40,110,180,0.15);" +
     "display:none;align-items:center;justify-content:center;font-size:16px;color:#cde;pointer-events:none;");
   main.append(grid, dropHint);
-  body.append(side, main);
+  mainWrap.append(selBar, main);
+  body.append(sideWrap, mainWrap);
   panel.append(header, body);
 
   let tree = null;
   let dir = startDir || "";
+  let images = [];
   let token = 0;
-
-  const currentLib = () => findDir(tree, dir)?.lib || null;
+  let lastClicked = null;
+  const selected = new Set();
+  const collapsed = new Set(loadPref("collapsed", []));
 
   function close() {
     overlay.remove();
     document.removeEventListener("keydown", onKey, true);
   }
   const onKey = (e) => {
-    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(); }
+    if (e.key === "Escape" && !document.querySelector("[data-cast-dialog]")) {
+      e.preventDefault(); e.stopPropagation(); close();
+    }
   };
   document.addEventListener("keydown", onKey, true);
   overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) close(); });
 
-  size.addEventListener("input", () => { storeSize(size.value); applySize(); });
-  function applySize() {
-    grid.style.gridTemplateColumns = `repeat(auto-fill,minmax(${size.value}px,1fr))`;
-  }
+  size.addEventListener("input", () => { storePref("thumbSize", Number(size.value)); applySize(); });
+  const applySize = () => { grid.style.gridTemplateColumns = `repeat(auto-fill,minmax(${size.value}px,1fr))`; };
   applySize();
 
-  function sideItem(text, indent, active, onClick, bold) {
-    const item = el("div",
-      `padding:3px 10px 3px ${10 + indent}px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;` +
-      `${bold ? "font-weight:bold;margin-top:4px;" : ""}${active ? "background:#2a6db0;color:#fff;" : ""}`, text);
-    item.title = text;
-    if (onClick) {
-      item.addEventListener("click", onClick);
-      item.addEventListener("mouseenter", () => { if (!active) item.style.background = "#333"; });
-      item.addEventListener("mouseleave", () => { if (!active) item.style.background = ""; });
+  // ---- drag & drop between gallery parts
+  const setDrag = (e, payload) => {
+    e.dataTransfer.setData(DRAG_TYPE, JSON.stringify(payload));
+    e.dataTransfer.effectAllowed = "move";
+  };
+  const readDrag = (e) => { try { return JSON.parse(e.dataTransfer.getData(DRAG_TYPE)); } catch { return null; } };
+
+  async function dropOnFolder(e, target) {
+    if (hasFiles(e)) {
+      await doUpload(e.dataTransfer.files, target);
+      return;
     }
-    return item;
+    const item = readDrag(e);
+    if (!item) return;
+    try {
+      if (item.kind === "images") {
+        const n = await moveImages(item.paths, target);
+        notify(`${n} image(s) moved to ${folderLabel(target)}`, "success");
+        item.paths.forEach((p) => selected.delete(p));
+        await show(dir);
+      } else if (item.kind === "folder") {
+        const moved = await moveFolder(item.path, target);
+        await show(dir === item.path || dir.startsWith(item.path + "/") ? moved + dir.slice(item.path.length) : dir);
+      }
+    } catch (err) { notify(err.message); }
   }
 
+  // ---- folder tree
   function renderSide() {
     side.textContent = "";
-    const groups = [["Persons", "person"], ["Libraries", "library"]];
-    for (const [label, kind] of groups) {
-      side.appendChild(el("div", "padding:6px 10px 2px;color:#888;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;", label));
-      const libs = (tree?.libraries || []).filter((l) => l.kind === kind);
-      if (!libs.length) side.appendChild(el("div", "padding:2px 18px;color:#666;font-style:italic;", "none yet – use ＋ New"));
-      for (const lib of libs) {
-        const single = lib.areas.length === 1 && lib.areas[0].name === "";
-        if (single) {
-          side.appendChild(sideItem(`${lib.name}  (${lib.areas[0].count})`, 8, dir === lib.areas[0].path, () => show(lib.areas[0].path), true));
-          continue;
-        }
-        side.appendChild(sideItem(lib.name, 8, false, () => show(lib.areas[0]?.path ?? lib.path), true));
-        for (const area of lib.areas) side.appendChild(sideItem(areaLabel(area), 22, dir === area.path, () => show(area.path)));
+    const rows = flattenTree(tree);
+    const hidden = (p) => [...collapsed].some((c) => p.startsWith(c + "/"));
+    for (const f of rows) {
+      if (hidden(f.path)) continue;
+      const active = f.path === dir;
+      const hasKids = rows.some((r) => r.path.startsWith(f.path ? f.path + "/" : "") && r.depth === f.depth + 1);
+      const row = el("div",
+        `display:flex;align-items:center;gap:2px;padding:3px 8px 3px ${4 + f.depth * 14}px;cursor:pointer;white-space:nowrap;` +
+        `${active ? "background:#2a6db0;color:#fff;" : ""}${f.depth ? "" : "font-weight:bold;"}`);
+      const tw = el("span", "width:14px;flex:0 0 14px;text-align:center;color:#999;", hasKids && f.depth ? (collapsed.has(f.path) ? "▸" : "▾") : "");
+      tw.addEventListener("click", (e) => {
+        if (!hasKids || !f.depth) return;
+        e.stopPropagation();
+        collapsed.has(f.path) ? collapsed.delete(f.path) : collapsed.add(f.path);
+        storePref("collapsed", [...collapsed]);
+        renderSide();
+      });
+      const name = el("span", "overflow:hidden;text-overflow:ellipsis;", `${f.depth ? "" : "🏠 "}${f.name}`);
+      const count = el("span", "color:#999;font-size:11px;margin-left:4px;", f.count ? `${f.count}` : "");
+      row.append(tw, name, count);
+      row.title = f.path || "Library root";
+      row.addEventListener("click", () => show(f.path));
+      if (f.depth) {
+        row.draggable = true;
+        row.addEventListener("dragstart", (e) => setDrag(e, { kind: "folder", path: f.path }));
       }
+      row.addEventListener("dragover", (e) => {
+        if (!hasFiles(e) && !hasItems(e)) return;
+        e.preventDefault();
+        row.style.outline = "2px solid #4af";
+      });
+      row.addEventListener("dragleave", () => { row.style.outline = ""; });
+      row.addEventListener("drop", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        row.style.outline = "";
+        dropOnFolder(e, f.path);
+      });
+      row.addEventListener("mouseenter", () => { if (!active) row.style.background = "#333"; });
+      row.addEventListener("mouseleave", () => { if (!active) row.style.background = ""; });
+      side.appendChild(row);
     }
   }
 
+  // ---- images
   function card(img) {
     const active = img.path === current;
+    const isSel = selected.has(img.path);
+    const border = isSel ? "#fa4" : active ? "#4af" : "transparent";
     const c = el("div",
-      `cursor:pointer;border-radius:6px;overflow:hidden;background:#111;border:2px solid ${active ? "#4af" : "transparent"};` +
-      "display:flex;flex-direction:column;");
+      `cursor:pointer;border-radius:6px;overflow:hidden;background:#111;border:2px solid ${border};display:flex;flex-direction:column;`);
     if (active) c.dataset.active = "1";
     const box = el("div", "position:relative;aspect-ratio:1/1;overflow:hidden;background:#181818;");
     const im = el("img", "position:absolute;inset:0;width:100%;height:100%;object-fit:contain;");
@@ -287,6 +457,13 @@ export async function openGallery({ startDir, current, onPick, onDirChange }) {
     im.src = libUrl("/thumb", { path: img.path, v: img.v, p: img.paint || 0 });
     im.draggable = false;
     box.appendChild(im);
+    const check = el("div",
+      `position:absolute;top:4px;left:4px;width:18px;height:18px;border-radius:4px;border:2px solid #fff;` +
+      `background:${isSel ? "#fa4" : "rgba(0,0,0,0.4)"};color:#000;font:bold 12px/16px sans-serif;text-align:center;` +
+      `display:${isSel || selected.size ? "block" : "none"};`, isSel ? "✓" : "");
+    check.title = "Select";
+    check.addEventListener("click", (e) => { e.stopPropagation(); toggle(img, e); });
+    box.appendChild(check);
     const badges = el("div", "position:absolute;top:4px;right:4px;display:flex;gap:3px;");
     const badge = (t, tip, bg) => { const b = el("span", `font:bold 10px sans-serif;padding:1px 4px;border-radius:3px;background:${bg};color:#fff;`, t); b.title = tip; return b; };
     if (img.mask) badges.appendChild(badge("M", "Has a MaskEditor mask", "#b04a2a"));
@@ -296,58 +473,97 @@ export async function openGallery({ startDir, current, onPick, onDirChange }) {
     const cap = el("div", "padding:3px 6px;font-size:11px;color:#ccc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;", img.name);
     cap.title = img.name;
     c.append(box, cap);
-    c.addEventListener("mouseenter", () => { if (!active) c.style.borderColor = "#666"; });
-    c.addEventListener("mouseleave", () => { if (!active) c.style.borderColor = "transparent"; });
-    c.addEventListener("click", () => { close(); onPick?.(img.path); });
+    c.draggable = true;
+    c.addEventListener("dragstart", (e) => {
+      const paths = selected.has(img.path) ? [...selected] : [img.path];
+      setDrag(e, { kind: "images", paths });
+    });
+    c.addEventListener("mouseenter", () => { check.style.display = "block"; if (!isSel && !active) c.style.borderColor = "#666"; });
+    c.addEventListener("mouseleave", () => { check.style.display = isSel || selected.size ? "block" : "none"; if (!isSel && !active) c.style.borderColor = "transparent"; });
+    c.addEventListener("click", (e) => {
+      if (e.ctrlKey || e.metaKey || e.shiftKey || selected.size) { toggle(img, e); return; }
+      close();
+      onPick?.(img.path);
+    });
     return c;
+  }
+
+  function toggle(img, e) {
+    if (e.shiftKey && lastClicked) {
+      const a = images.findIndex((i) => i.path === lastClicked), b = images.findIndex((i) => i.path === img.path);
+      if (a >= 0 && b >= 0) for (const i of images.slice(Math.min(a, b), Math.max(a, b) + 1)) selected.add(i.path);
+    } else if (selected.has(img.path)) {
+      selected.delete(img.path);
+    } else {
+      selected.add(img.path);
+    }
+    lastClicked = img.path;
+    renderGrid();
+  }
+
+  function renderGrid() {
+    grid.textContent = "";
+    for (const p of [...selected]) if (!images.some((i) => i.path === p)) selected.delete(p);
+    selBar.style.display = selected.size ? "flex" : "none";
+    selCount.textContent = `${selected.size} selected`;
+    if (!images.length) {
+      grid.appendChild(el("div", "color:#888;padding:20px;grid-column:1/-1;", "No images here – drop images here or use ⬆ Upload."));
+    }
+    for (const img of images) grid.appendChild(card(img));
   }
 
   async function show(newDir) {
     tree = await getTree();
-    if (newDir == null || !findDir(tree, newDir)) {
-      const first = tree.libraries.find((l) => l.areas.length);
-      newDir = findDir(tree, newDir || "")?.area?.path ?? first?.areas[0]?.path ?? "";
-    }
+    const all = flattenTree(tree);
+    if (!all.some((f) => f.path === newDir)) newDir = all.find((f) => f.depth === 1)?.path ?? "";
+    if (newDir !== dir) { selected.clear(); lastClicked = null; }
     dir = newDir;
+    // keep the shown folder visible in the tree
+    for (const c of [...collapsed]) if (dir.startsWith(c + "/")) collapsed.delete(c);
     onDirChange?.(dir);
     renderSide();
-    const hit = findDir(tree, dir);
-    pathLabel.textContent = hit ? `${hit.lib.name}${hit.area?.name ? " › " + hit.area.name : ""}` : "";
-    bUpload.disabled = !dir;
-    grid.textContent = "";
-    if (!dir) {
-      grid.appendChild(el("div", "color:#888;padding:20px;", "The library is empty. Create a person or a library with ＋ New."));
-      return;
-    }
+    pathLabel.textContent = folderLabel(dir).replaceAll("/", " › ");
+    for (const b of [bRename, bMoveFolder, bDeleteFolder]) b.disabled = !dir;
     const my = ++token;
     try {
-      const { images } = await getJSON("/images", { dir });
+      const res = await getJSON("/images", { dir });
       if (my !== token) return;
-      if (!images.length) {
-        grid.appendChild(el("div", "color:#888;padding:20px;grid-column:1/-1;", "No images yet – drop images here or use ⬆ Upload."));
-      }
-      for (const img of images) grid.appendChild(card(img));
-      grid.querySelector(`[data-active]`)?.scrollIntoView({ block: "center" });
+      images = res.images;
+      renderGrid();
+      grid.querySelector("[data-active]")?.scrollIntoView({ block: "center" });
     } catch (e) {
+      images = [];
+      grid.textContent = "";
       grid.appendChild(el("div", "color:#f77;padding:20px;", e.message));
     }
   }
 
-  async function doUpload(files) {
+  async function refresh() {
+    await getTree(true);
+    await show(dir);
+  }
+
+  async function doUpload(files, target = dir) {
     if (!files?.length) return;
     try {
-      const paths = await uploadFiles(dir, files);
-      notify(`${paths.length} image(s) added`, "success");
-      await show(dir);
+      const paths = await uploadFiles(target, files);
+      notify(`${paths.length} image(s) added to ${folderLabel(target)}`, "success");
+      await refresh();
     } catch (e) {
       notify(e.message);
     }
   }
 
-  // drag & drop upload
+  // files from the desktop dropped on the image area
   let dragDepth = 0;
-  main.addEventListener("dragenter", (e) => { if (!hasFiles(e) || !dir) return; e.preventDefault(); dragDepth++; dropHint.style.display = "flex"; dropHint.textContent = `Drop to add to ${pathLabel.textContent}`; });
-  main.addEventListener("dragover", (e) => { if (hasFiles(e) && dir) e.preventDefault(); });
+  main.addEventListener("dragenter", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth++;
+    dropHint.style.display = "flex";
+    dropHint.textContent = `Drop to add to ${folderLabel(dir)}`;
+  });
+  main.addEventListener("dragover", (e) => { if (hasFiles(e)) e.preventDefault(); });
   main.addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; dropHint.style.display = "none"; } });
   main.addEventListener("drop", (e) => {
     if (!hasFiles(e)) return;
@@ -358,5 +574,5 @@ export async function openGallery({ startDir, current, onPick, onDirChange }) {
     doUpload(e.dataTransfer.files);
   });
 
-  await show(dir);
+  await refresh();
 }

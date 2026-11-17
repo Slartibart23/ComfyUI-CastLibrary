@@ -1,49 +1,52 @@
 """
-Cast Library: file layout, listing, sidecar files and thumbnails.
+Cast Library: folder tree, listing, organising, sidecar files and thumbnails.
 
 The library is a plain folder tree below ComfyUI's user directory
-(``ComfyUI/user/cast_library``). Workflows only store paths relative to that
-root, so moving or reinstalling ComfyUI does not break them.
+(``ComfyUI/user/cast_library``), folders can be nested freely. Workflows only
+store paths relative to that root, so moving or reinstalling ComfyUI does not
+break them. A new library starts with:
 
     cast_library/
-    ├── Persons/          persons, one library per person
-    │   └── Anna/
-    │       ├── Face/     areas (sub folders), Face + Body by default
-    │       └── Body/
-    ├── Accessories/      plain libraries (images directly inside and/or areas)
-    └── Backgrounds/
+    ├── #TEMP/
+    ├── ACCESSORIES/
+    ├── BACKGROUNDS/
+    ├── CLOTHES/
+    └── PERSONS/
 
-Next to every image two optional sidecar files can exist (same stem):
+Next to every image optional sidecar files can exist (same stem); moving or
+deleting an image in the node takes them along:
 
     anna_01.png
     anna_01.mask.png    mask painted in ComfyUI's MaskEditor (white = masked)
     anna_01.paint.png   colour painted in the MaskEditor (RGBA, drawn over the image)
     anna_01.shape.json  rectangle / freehand shape drawn in the node preview
-
-Rename or delete an image in Explorer together with its sidecars.
 """
 
+import ctypes
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
-from typing import List, Optional, Tuple
+import time
+from io import BytesIO
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageOps
 
 ROOT_NAME = "cast_library"
-PERSONS_DIR = "Persons"
-DEFAULT_PERSON_AREAS = ("Face", "Body")
-DEFAULT_LIBRARIES = ("Accessories", "Backgrounds")
+DEFAULT_FOLDERS = ("#TEMP", "ACCESSORIES", "BACKGROUNDS", "CLOTHES", "PERSONS")
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif")
 MASK_SUFFIX = ".mask.png"
 PAINT_SUFFIX = ".paint.png"
 SHAPE_SUFFIX = ".shape.json"
+SIDECAR_SUFFIXES = (MASK_SUFFIX, PAINT_SUFFIX, SHAPE_SUFFIX)
 THUMB_DIR = ".thumbs"
+TRASH_DIR = ".trash"  # deleted files on systems without a reachable recycle bin
 THUMB_SIZE = 320
 MASK_EDITOR_SUBFOLDER = "cast_library"
 
@@ -75,11 +78,10 @@ def root_dir() -> str:
 
 
 def ensure_root() -> str:
-    """Create the root folder; on first creation also the default libraries."""
+    """Create the root folder; on first creation also the default folders."""
     root = root_dir()
     if not os.path.isdir(root):
-        os.makedirs(os.path.join(root, PERSONS_DIR), exist_ok=True)
-        for name in DEFAULT_LIBRARIES:
+        for name in DEFAULT_FOLDERS:
             os.makedirs(os.path.join(root, name), exist_ok=True)
     return root
 
@@ -156,14 +158,18 @@ def image_file(rel: str) -> str:
     return full
 
 
+def folder_dir(rel: str) -> str:
+    """Absolute path of an existing library folder ('' = the library root)."""
+    full = resolve(rel)
+    if not os.path.isdir(full):
+        raise LibraryError(f"Folder not found in the library: {rel!r}")
+    return full
+
+
 def describe(rel: str) -> Tuple[str, str]:
-    """(library name, area name) of an image path, e.g. ('Anna', 'Face')."""
-    parts = clean_rel(rel).split("/")[:-1]
-    if parts and parts[0] == PERSONS_DIR:
-        parts = parts[1:]
-    name = parts[0] if parts else ""
-    area = parts[1] if len(parts) > 1 else ""
-    return name, area
+    """(folder path, folder name) of an image, e.g. ('PERSONS/Anna/Face', 'Face')."""
+    folder = clean_rel(rel).rpartition("/")[0]
+    return folder, folder.rpartition("/")[2]
 
 
 # ----------------------------------------------------------------------
@@ -187,34 +193,21 @@ def _image_names(full: str) -> List[str]:
     return sorted(names, key=lambda n: (natural_key(os.path.splitext(n)[0]), n.lower()))
 
 
-def _library_entry(full: str, kind: str) -> dict:
-    rel = to_rel(full)
-    dirs = _subdirs(full)
-    if kind == "person":
-        # Face, Body first, then the person's own areas alphabetically
-        order = {a.lower(): i for i, a in enumerate(DEFAULT_PERSON_AREAS)}
-        dirs.sort(key=lambda d: order.get(d.lower(), len(order)))
-    areas = [
-        {"path": f"{rel}/{d}", "name": d, "count": len(_image_names(os.path.join(full, d)))}
-        for d in dirs
-    ]
-    own = len(_image_names(full))
-    if own or not areas:
-        # images directly in the library folder form an unnamed area
-        areas.insert(0, {"path": rel, "name": "", "count": own})
-    return {"path": rel, "name": os.path.basename(full), "kind": kind, "areas": areas}
+def _folder_entry(full: str) -> dict:
+    return {
+        "path": to_rel(full),
+        "name": os.path.basename(full),
+        "count": len(_image_names(full)),
+        "children": [_folder_entry(os.path.join(full, d)) for d in _subdirs(full)],
+    }
 
 
 def tree() -> dict:
+    """The whole folder tree; the root entry has path '' and holds the top-level folders."""
     root = ensure_root()
-    persons_full = os.path.join(root, PERSONS_DIR)
-    os.makedirs(persons_full, exist_ok=True)
-    libraries = [_library_entry(os.path.join(persons_full, d), "person") for d in _subdirs(persons_full)]
-    libraries += [
-        _library_entry(os.path.join(root, d), "library")
-        for d in _subdirs(root) if d != PERSONS_DIR
-    ]
-    return {"root": root, "persons_dir": PERSONS_DIR, "libraries": libraries}
+    entry = _folder_entry(root)
+    entry["name"] = "Cast Library"
+    return {"root": root, "tree": entry}
 
 
 def image_info(full: str) -> dict:
@@ -230,57 +223,130 @@ def image_info(full: str) -> dict:
 
 
 def list_images(dir_rel: str) -> List[dict]:
-    full = resolve(dir_rel)
-    if not os.path.isdir(full):
-        raise LibraryError(f"Folder not found in the library: {dir_rel!r}")
+    full = folder_dir(dir_rel)
     return [image_info(os.path.join(full, n)) for n in _image_names(full)]
 
 
 # ----------------------------------------------------------------------
-# creating folders
+# organising: folders and images
 # ----------------------------------------------------------------------
 
-def _mkdir_new(full: str, label: str) -> None:
+def _free_name(folder: str, stem: str, ext: str) -> str:
+    """'stem.ext' in folder, or 'stem (n).ext' if taken (also by a sidecar of that stem)."""
+    candidate, n = stem, 1
+    while os.path.exists(os.path.join(folder, candidate + ext)) or any(
+            os.path.exists(os.path.join(folder, candidate + s)) for s in SIDECAR_SUFFIXES):
+        candidate = f"{stem} ({n})"
+        n += 1
+    return candidate
+
+
+def _sidecars(image_full: str) -> List[str]:
+    return [p for p in (mask_path(image_full), paint_path(image_full), shape_path(image_full)) if os.path.isfile(p)]
+
+
+def _to_trash(paths: List[str]) -> None:
+    """Move files / folders to the recycle bin (Windows) or the library's .trash folder."""
+    if sys.platform == "win32":
+        _windows_recycle(paths)
+        return
+    trash = os.path.join(ensure_root(), TRASH_DIR, time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(trash, exist_ok=True)
+    for p in paths:
+        stem, ext = os.path.splitext(os.path.basename(p))
+        shutil.move(p, os.path.join(trash, _free_name(trash, stem, ext) + ext))
+
+
+class _SHFILEOPSTRUCTW(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("wFunc", ctypes.c_uint),
+        ("pFrom", ctypes.c_wchar_p),
+        ("pTo", ctypes.c_wchar_p),
+        ("fFlags", ctypes.c_ushort),
+        ("fAnyOperationsAborted", ctypes.c_int),
+        ("hNameMappings", ctypes.c_void_p),
+        ("lpszProgressTitle", ctypes.c_wchar_p),
+    ]
+
+
+def _windows_recycle(paths: List[str]) -> None:
+    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = 3, 0x4, 0x10, 0x40, 0x400
+    op = _SHFILEOPSTRUCTW()
+    op.wFunc = FO_DELETE
+    op.pFrom = "".join(os.path.abspath(p) + "\0" for p in paths) + "\0"
+    op.fFlags = FOF_SILENT | FOF_NOCONFIRMATION | FOF_ALLOWUNDO | FOF_NOERRORUI
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if result or op.fAnyOperationsAborted:
+        raise LibraryError(f"Could not move to the recycle bin (error {result:#x}). Is a file open in another program?")
+
+
+def create_folder(parent_rel: str, name: str) -> str:
+    full = os.path.join(folder_dir(parent_rel), check_name(name))
     if os.path.exists(full):
-        raise LibraryError(f'{label} "{os.path.basename(full)}" already exists.')
+        raise LibraryError(f'"{os.path.basename(full)}" already exists.')
     os.makedirs(full)
-
-
-def create_person(name: str) -> str:
-    name = check_name(name)
-    full = os.path.join(ensure_root(), PERSONS_DIR, name)
-    _mkdir_new(full, "Person")
-    for area in DEFAULT_PERSON_AREAS:
-        os.makedirs(os.path.join(full, area), exist_ok=True)
     return to_rel(full)
 
 
-def create_library(name: str) -> str:
-    name = check_name(name)
-    if name.lower() == PERSONS_DIR.lower():
-        raise LibraryError(f'"{PERSONS_DIR}" is reserved for persons.')
-    full = os.path.join(ensure_root(), name)
-    _mkdir_new(full, "Library")
-    return to_rel(full)
+def _existing_folder(rel: str) -> str:
+    if not clean_rel(rel):
+        raise LibraryError("The library root itself cannot be changed.")
+    return folder_dir(rel)
 
 
-def is_library(rel: str) -> bool:
-    parts = clean_rel(rel).split("/")
-    if parts[0] == PERSONS_DIR:
-        return len(parts) == 2
-    return len(parts) == 1 and parts[0] != ""
+def rename_folder(rel: str, name: str) -> str:
+    full = _existing_folder(rel)
+    target = os.path.join(os.path.dirname(full), check_name(name))
+    if os.path.normcase(target) != os.path.normcase(full) and os.path.exists(target):
+        raise LibraryError(f'"{name.strip()}" already exists.')
+    os.rename(full, target)
+    return to_rel(target)
 
 
-def create_area(library_rel: str, name: str) -> str:
-    name = check_name(name)
-    if not is_library(library_rel):
-        raise LibraryError(f"Not a library: {library_rel!r}")
-    lib = resolve(library_rel)
-    if not os.path.isdir(lib):
-        raise LibraryError(f"Library not found: {library_rel!r}")
-    full = os.path.join(lib, name)
-    _mkdir_new(full, "Area")
-    return to_rel(full)
+def move_folder(rel: str, target_rel: str) -> str:
+    full = _existing_folder(rel)
+    parent = folder_dir(target_rel)
+    if os.path.normcase(parent) == os.path.normcase(full) or \
+            os.path.normcase(parent).startswith(os.path.normcase(full) + os.sep):
+        raise LibraryError("A folder cannot be moved into itself.")
+    target = os.path.join(parent, os.path.basename(full))
+    if os.path.normcase(target) == os.path.normcase(full):
+        return to_rel(full)
+    if os.path.exists(target):
+        raise LibraryError(f'"{os.path.basename(full)}" already exists in the target folder.')
+    shutil.move(full, target)
+    return to_rel(target)
+
+
+def delete_folder(rel: str) -> None:
+    _to_trash([_existing_folder(rel)])
+
+
+def move_images(rels: List[str], target_rel: str) -> Dict[str, str]:
+    """Move images (with their sidecars) into a folder. Returns {old path: new path}."""
+    target = folder_dir(target_rel)
+    moved = {}
+    for rel in rels:
+        full = image_file(rel)
+        if os.path.normcase(os.path.dirname(full)) == os.path.normcase(target):
+            continue
+        stem, ext = os.path.splitext(os.path.basename(full))
+        new_stem = _free_name(target, stem, ext)
+        for old in [full] + _sidecars(full):
+            suffix = os.path.basename(old)[len(stem):]
+            shutil.move(old, os.path.join(target, new_stem + suffix))
+        moved[to_rel(full)] = to_rel(os.path.join(target, new_stem + ext))
+    return moved
+
+
+def delete_images(rels: List[str]) -> None:
+    paths = []
+    for rel in rels:
+        full = image_file(rel)
+        paths += [full] + _sidecars(full)
+    if paths:
+        _to_trash(paths)
 
 
 # ----------------------------------------------------------------------
@@ -289,28 +355,22 @@ def create_area(library_rel: str, name: str) -> str:
 
 def save_upload(dir_rel: str, filename: str, data: bytes) -> str:
     """Store an uploaded image in a library folder; never overwrites. Returns the relative path."""
-    folder = resolve(dir_rel)
-    if not os.path.isdir(folder) or not clean_rel(dir_rel):
-        raise LibraryError(f"Upload folder not found in the library: {dir_rel!r}")
+    folder = folder_dir(dir_rel)
     base = os.path.basename((filename or "").replace("\\", "/")).strip()
     stem, ext = os.path.splitext(base)
     stem = _INVALID_NAME.sub("_", stem).strip(" .") or "image"
     ext = ext.lower()
     if ext not in IMAGE_EXTENSIONS:
         raise LibraryError(f"Not a supported image file: {base!r}")
-    if stem.lower().endswith(".mask"):
-        stem = stem[:-5] + "_mask"
+    for marker in (".mask", ".paint"):  # would look like a sidecar file
+        if stem.lower().endswith(marker):
+            stem = stem[:-len(marker)] + "_" + marker[1:]
     try:
-        from io import BytesIO
         with Image.open(BytesIO(data)) as im:
             im.verify()
     except Exception:
         raise LibraryError(f"The file is not a readable image: {base!r}") from None
-    target = os.path.join(folder, stem + ext)
-    n = 1
-    while os.path.exists(target):
-        target = os.path.join(folder, f"{stem} ({n}){ext}")
-        n += 1
+    target = os.path.join(folder, _free_name(folder, stem, ext) + ext)
     with open(target, "wb") as f:
         f.write(data)
     return to_rel(target)
@@ -453,7 +513,6 @@ def _save_png(img: Image.Image, target: str) -> None:
 
 
 def _cleanup_editor_folder(folder: str, keep_days: float = 2.0) -> None:
-    import time
     limit = time.time() - keep_days * 86400
     try:
         for n in os.listdir(folder):

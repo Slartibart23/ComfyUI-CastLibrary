@@ -43,58 +43,117 @@ class LibraryTest(unittest.TestCase):
         fp.get_user_directory = lambda: os.path.join(self.tmp, "user")
         self._fp = sys.modules.get("folder_paths")
         sys.modules["folder_paths"] = fp
+        # deleting goes to a test trash instead of the real recycle bin
+        self.trashed = []
+        self._to_trash = lib._to_trash
+
+        def fake_trash(paths):
+            for path in paths:
+                self.trashed.append(lib.to_rel(path))
+                shutil.move(path, os.path.join(self.tmp, f"trash{len(self.trashed)}"))
+        lib._to_trash = fake_trash
 
     def tearDown(self):
         lib.set_root(None)
+        lib._to_trash = self._to_trash
         if self._fp is not None:
             sys.modules["folder_paths"] = self._fp
         else:
             sys.modules.pop("folder_paths", None)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_defaults_and_tree(self):
-        t = lib.tree()
-        names = [(l["kind"], l["name"]) for l in t["libraries"]]
-        self.assertEqual(names, [("library", "Accessories"), ("library", "Backgrounds")])
-        self.assertTrue(os.path.isdir(os.path.join(self.root, "Persons")))
-
-    def test_person_areas_upload_describe(self):
-        self.assertEqual(lib.create_person("Anna"), "Persons/Anna")
-        with self.assertRaises(lib.LibraryError):
-            lib.create_person("Anna")
-        self.assertEqual(lib.create_area("Persons/Anna", "Outfits"), "Persons/Anna/Outfits")
-        anna = next(l for l in lib.tree()["libraries"] if l["name"] == "Anna")
-        self.assertEqual(anna["kind"], "person")
-        self.assertEqual([a["name"] for a in anna["areas"]], ["Face", "Body", "Outfits"])
-
-        p1 = lib.save_upload("Persons/Anna/Face", "face.png", png_bytes())
-        p2 = lib.save_upload("Persons/Anna/Face", "face.png", png_bytes())
-        self.assertEqual(p1, "Persons/Anna/Face/face.png")
-        self.assertEqual(p2, "Persons/Anna/Face/face (1).png")
-        self.assertEqual(lib.describe(p1), ("Anna", "Face"))
-        self.assertEqual(lib.describe("Accessories/hat.png"), ("Accessories", ""))
-        imgs = lib.list_images("Persons/Anna/Face")
-        self.assertEqual([i["name"] for i in imgs], ["face.png", "face (1).png"])
+    def test_defaults_and_nested_tree(self):
+        t = lib.tree()["tree"]
+        self.assertEqual((t["path"], t["name"]), ("", "Cast Library"))
+        self.assertEqual([c["name"] for c in t["children"]], ["#TEMP", "ACCESSORIES", "BACKGROUNDS", "CLOTHES", "PERSONS"])
+        # any depth is listed (images used to vanish below the second level)
+        deep = "PERSONS/Susanne/Gesicht/close"
+        os.makedirs(lib.resolve(deep))
+        p1 = lib.save_upload(deep, "face.png", png_bytes())
+        p2 = lib.save_upload(deep, "face.png", png_bytes())
+        self.assertEqual((p1, p2), (f"{deep}/face.png", f"{deep}/face (1).png"))
+        node = lib.tree()["tree"]
+        for name in deep.split("/"):
+            node = next(c for c in node["children"] if c["name"] == name)
+        self.assertEqual((node["path"], node["count"]), (deep, 2))
+        self.assertEqual([i["name"] for i in lib.list_images(deep)], ["face.png", "face (1).png"])
+        self.assertEqual(lib.describe(p1), (deep, "close"))
+        self.assertEqual(lib.describe("hat.png"), ("", ""))
         self.assertTrue(os.path.isfile(lib.thumbnail(p1)))
+        # an existing library is left as it is (no default folders added)
+        lib.set_root(os.path.join(self.tmp, "other"))
+        os.makedirs(os.path.join(self.tmp, "other", "Personen"))
+        self.assertEqual([c["name"] for c in lib.tree()["tree"]["children"]], ["Personen"])
+
+    def test_folder_management(self):
+        self.assertEqual(lib.create_folder("PERSONS", "Anna"), "PERSONS/Anna")
+        self.assertEqual(lib.create_folder("PERSONS/Anna", "Face"), "PERSONS/Anna/Face")
+        self.assertEqual(lib.create_folder("", "EXTRA"), "EXTRA")
+        with self.assertRaises(lib.LibraryError):
+            lib.create_folder("PERSONS", "Anna")
+        img = lib.save_upload("PERSONS/Anna/Face", "a.png", png_bytes())
+        Image.new("L", (64, 48), 255).save(lib.mask_path(lib.image_file(img)))
+
+        self.assertEqual(lib.rename_folder("PERSONS/Anna", "Anna B"), "PERSONS/Anna B")
+        self.assertEqual(lib.rename_folder("PERSONS/Anna B", "anna b"), "PERSONS/anna b")  # case only
+        self.assertEqual(lib.move_folder("PERSONS/anna b", "EXTRA"), "EXTRA/anna b")
+        self.assertTrue(os.path.isfile(lib.mask_path(lib.image_file("EXTRA/anna b/Face/a.png"))))
+        for bad in (lambda: lib.move_folder("EXTRA", "EXTRA/anna b"),   # into itself
+                    lambda: lib.move_folder("EXTRA", "EXTRA"),
+                    lambda: lib.rename_folder("", "x"),                 # root
+                    lambda: lib.delete_folder(""),
+                    lambda: lib.rename_folder("EXTRA", "PERSONS")):     # exists
+            with self.assertRaises(lib.LibraryError):
+                bad()
+        self.assertEqual(lib.move_folder("EXTRA/anna b", "EXTRA"), "EXTRA/anna b")  # same place: no-op
+        lib.delete_folder("EXTRA")
+        self.assertEqual(self.trashed, ["EXTRA"])
+        self.assertFalse(os.path.exists(lib.resolve("EXTRA")))
+
+    def test_move_and_delete_images_with_sidecars(self):
+        a = lib.save_upload("#TEMP", "a.png", png_bytes())
+        full = lib.image_file(a)
+        Image.new("L", (64, 48), 255).save(lib.mask_path(full))
+        Image.new("RGBA", (64, 48)).save(lib.paint_path(full))
+        lib.write_shape(full, {"rect": [0, 0, 1, 1]})
+        lib.save_upload("PERSONS", "a.png", png_bytes())  # name taken in the target
+
+        moved = lib.move_images([a], "PERSONS")
+        self.assertEqual(moved, {"#TEMP/a.png": "PERSONS/a (1).png"})
+        new_full = lib.image_file("PERSONS/a (1).png")
+        for side in (lib.mask_path, lib.paint_path, lib.shape_path):
+            self.assertTrue(os.path.isfile(side(new_full)))
+        self.assertEqual(os.listdir(lib.resolve("#TEMP")), [])
+        self.assertEqual(lib.move_images(["PERSONS/a (1).png"], "PERSONS"), {})  # same folder
+
+        lib.delete_images(["PERSONS/a (1).png"])
+        self.assertEqual(sorted(self.trashed), sorted(["PERSONS/a (1).png", "PERSONS/a (1).mask.png",
+                                                       "PERSONS/a (1).paint.png", "PERSONS/a (1).shape.json"]))
+        self.assertEqual([i["name"] for i in lib.list_images("PERSONS")], ["a.png"])
+        with self.assertRaises(lib.LibraryError):
+            lib.delete_images(["PERSONS/missing.png"])
 
     def test_rejects_bad_paths_and_names(self):
-        for bad in ("../x", "Persons/../../x", ".thumbs/a"):
+        for bad in ("../x", "PERSONS/../../x", ".thumbs/a"):
             with self.assertRaises(lib.LibraryError):
                 lib.resolve(bad)
-        for bad in ("", "a/b", "con:", ".hidden", "Persons"):
+        for bad in ("", "a/b", "con:", ".hidden", "x" * 81):
             with self.assertRaises(lib.LibraryError):
-                lib.create_library(bad)
+                lib.create_folder("", bad)
         with self.assertRaises(lib.LibraryError):
-            lib.save_upload("Accessories", "x.txt", b"hello")
+            lib.save_upload("ACCESSORIES", "x.txt", b"hello")
         with self.assertRaises(lib.LibraryError):
-            lib.save_upload("Accessories", "x.png", b"not an image")
+            lib.save_upload("ACCESSORIES", "x.png", b"not an image")
+        with self.assertRaises(lib.LibraryError):
+            lib.save_upload("MISSING", "x.png", png_bytes())
+        self.assertEqual(lib.save_upload("ACCESSORIES", "x.mask.png", png_bytes()), "ACCESSORIES/x_mask.png")
 
     def test_shape_and_mask_editor_roundtrip(self):
-        rel = lib.save_upload("Accessories", "hat.png", png_bytes((40, 30), mode="RGB"))
+        rel = lib.save_upload("ACCESSORIES", "hat.png", png_bytes((40, 30), mode="RGB"))
         full = lib.image_file(rel)
         lib.write_shape(full, {"rect": [0.1, 0.1, 0.5, 0.5]})
         self.assertEqual(lib.read_shape(full), {"rect": [0.1, 0.1, 0.5, 0.5]})
-        self.assertTrue(lib.list_images("Accessories")[0]["shape"])
+        self.assertTrue(lib.list_images("ACCESSORIES")[0]["shape"])
         lib.write_shape(full, {})
         self.assertFalse(os.path.exists(lib.shape_path(full)))
 
@@ -123,7 +182,7 @@ class LibraryTest(unittest.TestCase):
         mask = np.asarray(lib.load_mask(full, (40, 30)))
         self.assertEqual(mask[:, :20].min(), 255)
         self.assertEqual(mask[:, 20:].max(), 0)
-        info = lib.list_images("Accessories")[0]
+        info = lib.list_images("ACCESSORIES")[0]
         self.assertTrue(info["mask"] and info["paint"])
         self.assertEqual(lib.load_paint(full, (40, 30)).getpixel((35, 5)), (255, 0, 0, 255))
         self.assertTrue(os.path.isfile(lib.thumbnail(rel)))
@@ -159,7 +218,7 @@ class LibraryTest(unittest.TestCase):
         main.save(buf, "MPO", save_all=True, append_images=[extra])
         with Image.open(BytesIO(buf.getvalue())) as check:
             self.assertEqual(getattr(check, "n_frames", 1), 2)
-        rel = lib.save_upload("Backgrounds", "phone.jpg", buf.getvalue())
+        rel = lib.save_upload("BACKGROUNDS", "phone.jpg", buf.getvalue())
         img, mask, w, h, *_ = CastLibraryLoadImage().load_image(rel, False, 512, 512, False, 32, "lanczos")
         self.assertEqual((tuple(img.shape), tuple(mask.shape), w, h), ((1, 60, 80, 3), (1, 60, 80), 80, 60))
         self.assertGreater(float(img[0, 30, 40, 0]), 0.9)
@@ -169,7 +228,7 @@ class LibraryTest(unittest.TestCase):
             from cast_library.node import CastLibraryLoadImage
         except Exception as e:
             self.skipTest(f"node import failed: {e}")
-        rel = lib.save_upload("Backgrounds", "sky.png", png_bytes((40, 30), color=(0, 0, 255, 255), mode="RGB"))
+        rel = lib.save_upload("BACKGROUNDS", "sky.png", png_bytes((40, 30), color=(0, 0, 255, 255), mode="RGB"))
         paint = Image.new("RGBA", (40, 30), (0, 0, 0, 0))
         paint.paste((255, 0, 0, 255), (0, 0, 10, 10))
         paint.paste((0, 255, 0, 128), (20, 0, 30, 10))
@@ -185,27 +244,43 @@ class LibraryTest(unittest.TestCase):
             from cast_library.node import CastLibraryLoadImage
         except Exception as e:  # torch / comfy not importable outside ComfyUI
             self.skipTest(f"node import failed: {e}")
-        lib.create_person("Tom")
-        rel = lib.save_upload("Persons/Tom/Body", "body.png", png_bytes((50, 40), mode="RGB"))
+        os.makedirs(lib.resolve("PERSONS/Tom/Body"))
+        rel = lib.save_upload("PERSONS/Tom/Body", "body.png", png_bytes((50, 40), mode="RGB"))
         full = lib.image_file(rel)
         Image.fromarray(np.pad(np.full((40, 25), 255, np.uint8), ((0, 0), (0, 25)))).save(lib.mask_path(full))
         node = CastLibraryLoadImage()
         self.assertIs(CastLibraryLoadImage.VALIDATE_INPUTS(library_image=rel), True)
         self.assertIsInstance(CastLibraryLoadImage.VALIDATE_INPUTS(library_image=""), str)
 
-        img, mask, w, h, fname, name, area = node.load_image(rel, False, 512, 512, False, 32, "lanczos")
+        img, mask, w, h, fname, folder, folder_name = node.load_image(rel, False, 512, 512, False, 32, "lanczos",
+                                                             crop_to_mask=False)
         self.assertEqual(tuple(img.shape), (1, 40, 50, 3))
-        self.assertEqual((w, h, fname, name, area), (50, 40, "body", "Tom", "Body"))
+        self.assertEqual((w, h, fname, folder, folder_name), (50, 40, "body", "PERSONS/Tom/Body", "Body"))
         self.assertEqual(float(mask[0, :, :25].min()), 1.0)
         self.assertEqual(float(mask[0, :, 25:].max()), 0.0)
 
         img, mask, w, h, *_ = node.load_image(rel, True, 64, 64, False, 32, "bilinear", "rectangle",
-                                              "yellow", '{"rect":[0,0,0.5,0.5]}')
+                                              "yellow", '{"rect":[0,0,0.5,0.5]}', False)
         self.assertEqual((w, h), (64, 64))
         self.assertEqual(tuple(mask.shape), (1, 64, 64))
         self.assertGreater(float(mask[0, :32, :32].mean()), 0.9)
         self.assertLess(float(mask[0, 32:, 32:].mean()), 0.1)
 
+        # crop_to_mask (default on) cuts out the mask's bounding box, like Image Crop By Mask
+        img, mask, w, h, *_ = node.load_image(rel, False, 512, 512, False, 32, "lanczos")
+        self.assertEqual((tuple(img.shape), w, h), ((1, 40, 25, 3), 25, 40))
+        self.assertEqual(float(mask.min()), 1.0)
+        img, mask, w, h, *_ = node.load_image(rel, False, 512, 512, False, 32, "lanczos", "rectangle",
+                                              "yellow", '{"rect":[0.2,0.25,0.4,0.5]}')
+        self.assertEqual((w, h), (20, 20))
+        # crop first, then resize the cut-out
+        _, _, w, h, *_ = node.load_image(rel, True, 64, 64, False, 32, "bilinear", "rectangle",
+                                         "yellow", '{"rect":[0.2,0.25,0.4,0.5]}')
+        self.assertEqual((w, h), (64, 64))
+        # without a mask nothing is cropped
+        os.remove(lib.mask_path(full))
+        _, mask, w, h, *_ = node.load_image(rel, False, 512, 512, False, 32, "lanczos")
+        self.assertEqual((w, h, float(mask.max())), (50, 40, 0.0))
 
     def test_large_images_are_scaled_to_2048(self):
         try:
@@ -217,13 +292,13 @@ class LibraryTest(unittest.TestCase):
         cases = [((3000, 1000), (2048, 683)), ((1200, 4096), (600, 2048)), ((2048, 1024), (2048, 1024)),
                  ((800, 600), (800, 600))]
         for (w, h), expected in cases:
-            rel = lib.save_upload("Backgrounds", f"bg_{w}x{h}.png", png_bytes((w, h), mode="RGB"))
+            rel = lib.save_upload("BACKGROUNDS", f"bg_{w}x{h}.png", png_bytes((w, h), mode="RGB"))
             if w == 3000:
                 # mask on the left third, must survive the downscale
                 m = np.zeros((h, w), np.uint8)
                 m[:, :1000] = 255
                 Image.fromarray(m).save(lib.mask_path(lib.image_file(rel)))
-            img, mask, ow, oh, *_ = node.load_image(rel, False, 512, 512, False, 32, "lanczos")
+            img, mask, ow, oh, *_ = node.load_image(rel, False, 512, 512, False, 32, "lanczos", crop_to_mask=False)
             self.assertEqual((ow, oh), expected, (w, h))
             self.assertEqual(tuple(img.shape), (1, expected[1], expected[0], 3))
             self.assertEqual(tuple(mask.shape), (1, expected[1], expected[0]))
@@ -233,9 +308,12 @@ class LibraryTest(unittest.TestCase):
                 self.assertLess(float(mask[0, :, 750:].mean()), 0.01)
 
         # the optional resize still works on top of the limit
-        rel = "Backgrounds/bg_3000x1000.png"
-        _, _, ow, oh, *_ = node.load_image(rel, True, 1024, 1024, True, 8, "bilinear")
+        rel = "BACKGROUNDS/bg_3000x1000.png"
+        _, _, ow, oh, *_ = node.load_image(rel, True, 1024, 1024, True, 8, "bilinear", crop_to_mask=False)
         self.assertEqual((ow, oh), (1024, 336))
+        # with crop_to_mask the 1000x1000 cut-out stays below the limit
+        _, _, ow, oh, *_ = node.load_image(rel, False, 512, 512, False, 32, "lanczos")
+        self.assertEqual((ow, oh), (1000, 1000))
 
 
 if __name__ == "__main__":

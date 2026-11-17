@@ -1,11 +1,11 @@
-// "Cast Library · Load & Resize Image": library / area pickers, gallery,
-// upload, Explorer button, preview with rectangle / freehand editor and the
-// bridge to ComfyUI's MaskEditor (masks are stored next to the library image).
+// "Cast Library · Load & Resize Image": folder picker, gallery, upload,
+// Explorer button, preview with rectangle / freehand editor and the bridge to
+// ComfyUI's MaskEditor (masks are stored next to the library image).
 
 import {
-  el, notify, getJSON, postJSON, libUrl, dirOf, baseOf, hasFiles, button,
-  getTree, onTreeChange, findDir, areaLabel, uploadFiles, pickFiles, openInExplorer,
-  newEntryDialog, openGallery,
+  el, notify, getJSON, postJSON, libUrl, dirOf, baseOf, folderLabel, hasFiles, button,
+  getTree, onTreeChange, flattenTree, onPathsMoved, uploadFiles, pickFiles, openInExplorer,
+  newFolderDialog, openGallery,
 } from "./cast_library_ui.js";
 
 const { app } = window.comfyAPI.app;
@@ -78,22 +78,18 @@ function setupNode(node) {
   const wrapper = el("div", "display:flex;flex-direction:column;gap:4px;width:100%;height:100%;box-sizing:border-box;overflow:hidden;position:relative;");
   const pickRow = el("div", "display:flex;flex-wrap:wrap;align-items:center;gap:4px;font:12px sans-serif;");
   const selCss = "flex:1 1 90px;min-width:70px;max-width:100%;padding:1px 2px;background:#222;color:#ddd;border:1px solid #555;border-radius:4px;font:12px sans-serif;";
-  const libSelect = el("select", selCss);
-  const areaSelect = el("select", selCss);
-  libSelect.title = "Person or library";
-  areaSelect.title = "Area (folder) inside the library";
-  for (const s of [libSelect, areaSelect]) {
-    s.addEventListener("pointerdown", (e) => e.stopPropagation());
-    s.addEventListener("wheel", (e) => e.stopPropagation());
-  }
-  const bGallery = button("🖼 Gallery", "Open the library and pick an image", () => showGallery(), "background:#2a6db0;");
-  const bUpload = button("⬆", "Upload images into the selected area (or drop files on the node)", async () => handleUpload(await pickFiles()));
-  const bExplorer = button("📂", "Open the selected folder in Explorer", () => openInExplorer(currentDir() || ""));
-  const bNew = button("＋", "New person, library or area", async () => {
-    const path = await newEntryDialog(findDir(tree, currentDir() || "")?.lib || null);
-    if (path) setDir(findDir(await getTree(), path)?.area?.path ?? path);
+  const folderSelect = el("select", selCss);
+  folderSelect.title = "Folder for the gallery and for uploads";
+  folderSelect.addEventListener("pointerdown", (e) => e.stopPropagation());
+  folderSelect.addEventListener("wheel", (e) => e.stopPropagation());
+  const bGallery = button("🖼 Gallery", "Open the library: pick, move and delete images, manage folders", () => showGallery(), "background:#2a6db0;");
+  const bUpload = button("⬆", "Upload images into the selected folder (or drop files on the node)", async () => handleUpload(await pickFiles()));
+  const bExplorer = button("📂", "Open the selected folder in Explorer", () => openInExplorer(currentDir()));
+  const bNew = button("＋", "New folder inside the selected folder", async () => {
+    const path = await newFolderDialog(currentDir());
+    if (path) setDir(path);
   });
-  pickRow.append(libSelect, areaSelect, bGallery, bUpload, bExplorer, bNew);
+  pickRow.append(folderSelect, bGallery, bUpload, bExplorer, bNew);
 
   const bar = el("div", "display:flex;flex-wrap:wrap;align-items:center;gap:4px;font:12px sans-serif;color:var(--input-text,#ddd);min-height:22px;");
   const info = el("div", "font:11px sans-serif;color:var(--descrip-text,#999);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;");
@@ -136,11 +132,12 @@ function setupNode(node) {
     draw();
   }
 
-  node.addDOMWidget("cast_library_ui", "CastLibraryUI", wrapper, {
+  const uiWidget = node.addDOMWidget("cast_library_ui", "CastLibraryUI", wrapper, {
     serialize: false,
     hideOnZoom: false,
     getMinHeight: () => 260,
   });
+  uiWidget.serialize = false; // keep it out of widgets_values
   setTimeout(() => {
     if (node.size[0] < 400 || node.size[1] < 680) {
       node.setSize([Math.max(node.size[0], 400), Math.max(node.size[1], 680)]);
@@ -154,6 +151,7 @@ function setupNode(node) {
   let current = null;       // { path, v, mask, shape } of the loaded library image
   let img = null;           // HTMLImageElement of that image
   let maskOverlay = null;   // red canvas of the stored MaskEditor mask
+  let maskBounds = null;    // its bounding box [x, y, w, h], relative
   let paintLayer = null;    // colour painted in the MaskEditor (part of the output image)
   let message = "";
   let loadToken = 0;
@@ -165,47 +163,33 @@ function setupNode(node) {
   let lastImported = "";
 
   const mode = () => W("mask_source")?.value || "MaskEditor";
-  const currentDir = () => node.properties.castDir || dirOf(pathWidget.value) || "";
+  const currentDir = () => node.properties.castDir ?? dirOf(pathWidget.value);
 
-  // --------------------------------------------------------- library / area
+  // ---------------------------------------------------------------- folder
   function setDir(dir) {
     node.properties.castDir = dir;
     renderSelects();
   }
 
   function renderSelects() {
+    const folders = flattenTree(tree);
     let dir = currentDir();
-    let hit = findDir(tree, dir);
-    if (!hit && !pathWidget.value && tree?.libraries?.length) {
-      // nothing chosen yet: start with the first person / library
-      const first = tree.libraries[0];
-      node.properties.castDir = dir = first.areas[0]?.path ?? first.path;
-      hit = findDir(tree, dir);
+    if (folders.length && node.properties.castDir == null && !pathWidget.value) {
+      // nothing chosen yet: start with the first top-level folder (#TEMP)
+      node.properties.castDir = dir = folders.find((f) => f.depth === 1)?.path ?? "";
     }
-    libSelect.textContent = "";
-    areaSelect.textContent = "";
-    const groups = { person: el("optgroup"), library: el("optgroup") };
-    groups.person.label = "Persons";
-    groups.library.label = "Libraries";
-    for (const lib of tree?.libraries || []) {
-      groups[lib.kind].appendChild(Object.assign(el("option", null, lib.name), { value: lib.path }));
+    folderSelect.textContent = "";
+    for (const f of folders) {
+      const label = `${"   ".repeat(f.depth)}${f.depth ? f.name : "🏠 Cast Library"}${f.count ? `  (${f.count})` : ""}`;
+      folderSelect.appendChild(Object.assign(el("option", null, label), { value: f.path }));
     }
-    for (const g of Object.values(groups)) if (g.children.length) libSelect.appendChild(g);
-    if (!tree?.libraries?.length) libSelect.appendChild(Object.assign(el("option", null, "– empty, use ＋ –"), { value: "" }));
-    libSelect.value = hit?.lib.path ?? "";
-    for (const area of hit?.lib.areas || []) {
-      areaSelect.appendChild(Object.assign(el("option", null, areaLabel(area)), { value: area.path }));
+    if (!folders.some((f) => f.path === dir)) {
+      folderSelect.appendChild(Object.assign(el("option", null, `${dir} (missing)`), { value: dir }));
     }
-    areaSelect.value = hit?.area?.path ?? "";
-    areaSelect.disabled = !hit || hit.lib.areas.length < 2;
-    bUpload.disabled = bExplorer.disabled = !hit;
+    folderSelect.value = dir;
   }
 
-  libSelect.addEventListener("change", () => {
-    const lib = tree?.libraries.find((l) => l.path === libSelect.value);
-    setDir(lib?.areas[0]?.path ?? lib?.path ?? "");
-  });
-  areaSelect.addEventListener("change", () => setDir(areaSelect.value));
+  folderSelect.addEventListener("change", () => setDir(folderSelect.value));
 
   async function refreshTree(force = false) {
     try {
@@ -216,6 +200,20 @@ function setupNode(node) {
     renderSelects();
   }
   const offTree = onTreeChange((t) => { tree = t; renderSelects(); });
+  // images or folders were moved / renamed in a gallery: follow them
+  const offMoved = onPathsMoved((remap) => {
+    const path = pathWidget.value && remap(pathWidget.value);
+    if (path) {
+      pathWidget.value = path;
+      wantedPath = path;
+      if (current) current.path = path;
+      meRef = null;
+      prepareMaskEditor();
+    }
+    const dir = node.properties.castDir && remap(node.properties.castDir);
+    if (dir) node.properties.castDir = dir;
+    node.setDirtyCanvas?.(true, true);
+  });
 
   // ---------------------------------------------------------- picking
   async function pick(path) {
@@ -241,7 +239,7 @@ function setupNode(node) {
     if (!files?.length) return;
     try {
       const paths = await uploadFiles(currentDir(), files);
-      notify(`${paths.length} image(s) added to ${currentDir()}`, "success");
+      notify(`${paths.length} image(s) added to ${folderLabel(currentDir())}`, "success");
       if (paths.length === 1) await pick(paths[0]);
     } catch (e) {
       notify(e.message);
@@ -278,10 +276,9 @@ function setupNode(node) {
         img = im;
       }
       message = "";
-      const { lib, area } = splitPath(path);
       const [ow, oh] = limitedSize(img.naturalWidth, img.naturalHeight);
       const scaled = ow !== img.naturalWidth ? `  → ${ow}×${oh}` : "";
-      info.textContent = `${lib}${area ? " › " + area : ""} › ${baseOf(path)}  ${img.naturalWidth}×${img.naturalHeight}${scaled}`;
+      info.textContent = `${path.replaceAll("/", " › ")}  ${img.naturalWidth}×${img.naturalHeight}${scaled}`;
       info.title = path;
       await loadMaskOverlay(token);
       await loadPaintLayer(token);
@@ -297,14 +294,10 @@ function setupNode(node) {
     draw();
   }
 
-  function splitPath(path) {
-    const parts = path.split("/").slice(0, -1);
-    if (parts[0] === (tree?.persons_dir || "Persons")) parts.shift();
-    return { lib: parts[0] || "", area: parts[1] || "" };
-  }
 
   async function loadMaskOverlay(token) {
     maskOverlay = null;
+    maskBounds = null;
     if (!current?.mask || !img) return;
     try {
       const m = await fetchImage(libUrl("/mask", { path: current.path, v: current.mask }));
@@ -314,12 +307,23 @@ function setupNode(node) {
       const ctx = c.getContext("2d");
       ctx.drawImage(m, 0, 0);
       const px = ctx.getImageData(0, 0, c.width, c.height);
+      let minX = c.width, minY = c.height, maxX = -1, maxY = -1;
       for (let i = 0; i < px.data.length; i += 4) {
         const a = px.data[i];
+        if (a >= 128) {
+          const x = (i / 4) % c.width, y = Math.floor(i / 4 / c.width);
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
         px.data[i] = 255; px.data[i + 1] = 40; px.data[i + 2] = 40; px.data[i + 3] = a * 0.5;
       }
       ctx.putImageData(px, 0, 0);
       maskOverlay = c;
+      // what crop_to_mask will cut out (relative)
+      maskBounds = maxX < 0 ? null
+        : [minX / c.width, minY / c.height, (maxX + 1 - minX) / c.width, (maxY + 1 - minY) / c.height];
     } catch {
       maskOverlay = null;
     }
@@ -555,6 +559,15 @@ function setupNode(node) {
     if (paintLayer) ctx.drawImage(paintLayer, box.x, box.y, box.w, box.h);
 
     if (m === "MaskEditor" && maskOverlay) ctx.drawImage(maskOverlay, box.x, box.y, box.w, box.h);
+    if (m === "MaskEditor" && maskBounds && W("crop_to_mask")?.value) {
+      const [x, y, w, h] = maskBounds;
+      ctx.strokeStyle = "#4af";
+      ctx.setLineDash([5, 4]);
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(box.x + x * box.w, box.y + y * box.h, w * box.w, h * box.h);
+      ctx.setLineDash([]);
+      label(ctx, `crop ${Math.round(w * img.naturalWidth)}×${Math.round(h * img.naturalHeight)}`, box.x + x * box.w + 4, box.y + y * box.h + 4);
+    }
 
     if (m === "rectangle" && data.rect) {
       const hs = rectHandles(box);
@@ -760,8 +773,7 @@ function setupNode(node) {
   let dragDepth = 0;
   const showDrop = (on) => {
     dropHint.style.display = on ? "flex" : "none";
-    const hit = findDir(tree, currentDir());
-    dropHint.textContent = hit ? `Add to ${hit.lib.name}${hit.area?.name ? " › " + hit.area.name : ""}` : "Choose a library first";
+    dropHint.textContent = `Add to ${folderLabel(currentDir()).replaceAll("/", " › ")}`;
   };
   wrapper.addEventListener("dragenter", (e) => { if (!hasFiles(e)) return; e.preventDefault(); dragDepth++; showDrop(true); });
   wrapper.addEventListener("dragover", (e) => { if (hasFiles(e)) { e.preventDefault(); e.stopPropagation(); } });
@@ -813,7 +825,7 @@ function setupNode(node) {
       if (pathWidget.value && dirOf(pathWidget.value) !== node.properties.castDir) setDir(dirOf(pathWidget.value));
       loadCurrent();
     }
-    const look = `${mode()}|${W("fill_color")?.value}|${current?.mask}|${current?.paint}`;
+    const look = `${mode()}|${W("fill_color")?.value}|${W("crop_to_mask")?.value}|${current?.mask}|${current?.paint}`;
     if (changed || look !== lastLook) {
       lastLook = look;
       draw();
@@ -830,6 +842,9 @@ function setupNode(node) {
   const onConfigure = node.onConfigure;
   node.onConfigure = function () {
     const r = onConfigure?.apply(this, arguments);
+    // workflows saved with 1.1.x stored the preview widget's "" where crop_to_mask is now
+    const crop = W("crop_to_mask");
+    if (crop && typeof crop.value !== "boolean") crop.value = true;
     data = parseData(dataWidget.value);
     lastDataValue = dataWidget.value;
     if (pathWidget.value) node.properties.castDir = dirOf(pathWidget.value);
@@ -842,6 +857,7 @@ function setupNode(node) {
     clearInterval(timer);
     window.removeEventListener("focus", onFocus);
     offTree();
+    offMoved();
     return onRemoved?.apply(this, arguments);
   };
 

@@ -1,9 +1,8 @@
 # ComfyUI Cast Library
 
-An image library right inside ComfyUI. Keep your **persons** (each with face and body
-areas, more areas on demand), **accessories**, **backgrounds** and any other library you
-like in one place, pick an image in a gallery and get it into your workflow as
-**image + mask** with optional resize.
+An image library right inside ComfyUI. Keep persons, backgrounds, accessories, clothes
+and anything else in your own folder tree, organise it in the node, pick an image in a
+gallery and get it into your workflow as **image + mask** with optional crop and resize.
 
 [Deutsche Anleitung](README.de.md)
 
@@ -11,56 +10,64 @@ like in one place, pick an image in a gallery and get it into your workflow as
 
 | Control | What it does |
 | --- | --- |
-| Library / area dropdowns | Choose a person or library and one of its areas (folders) |
-| 🖼 Gallery | Opens the library window: all persons and libraries on the left, thumbnails on the right. Click an image to use it |
-| ⬆ | Upload images into the selected area. You can also drop files onto the node or into the gallery |
-| 📂 | Opens the selected folder in Explorer (for renaming or deleting) |
-| ＋ | New person (gets the areas *Face* and *Body*), new library, or new area in the selected library |
+| Folder dropdown | The folder for the gallery and for uploads |
+| 🖼 Gallery | Opens the library window (see below). Click an image to use it |
+| ⬆ | Upload images into the selected folder. You can also drop files onto the node |
+| 📂 | Opens the selected folder in Explorer |
+| ＋ | New folder inside the selected folder |
 | resize, width, height, keep_proportion, divisible_by, upscale_method | Optional resize, same as *Load & Resize Image + Filename* |
 | mask_source | **MaskEditor**: the mask painted with the *Mask Editor* button (or right-click → Open in MaskEditor), stored with the library image; without one the image's alpha channel. **rectangle**: drag a rectangle in the preview. **freehand**: paint the area to keep (brush, lasso, eraser); outside it the image is filled with `fill_color` |
-
-**Maximum size:** if the longest side of an image is larger than 2048 px, the node
-scales image and mask down proportionally so that the longest side is 2048 px (before
-the optional resize). The file in the library stays untouched; the preview line shows
-the output size, e.g. `4000×3000 → 2048×1536`.
+| crop_to_mask | **on** (default): image and mask are cut to the bounding box of the mask, like KJNodes *Image Crop By Mask*, before the size limit and the resize. Without a mask nothing is cropped. In MaskEditor mode the preview shows the crop as a dashed frame. **off**: full image |
 
 **Outputs:** `image`, `mask`, `width`, `height`, `filename` (without extension),
-`name` (person or library, e.g. `Anna`), `area` (e.g. `Face`, empty for the main
-folder of a library).
+`folder` (folder of the image, e.g. `PERSONS/Anna/Face`) and `folder_name` (`Face`).
+
+**Maximum size:** if the longest side of an image is larger than 2048 px, the node
+scales image and mask down proportionally so that the longest side is 2048 px (after the
+crop, before the optional resize). The file in the library stays untouched.
 
 **Painting with colour:** in the MaskEditor, the paint brush (second tool) paints
 with a solid colour. That colour becomes part of the output image, in every
 `mask_source` mode, and is shown in the node preview. *Remove paint* deletes it again.
 
+## The gallery
+
+* **Folder tree** on the left, any depth. ▾/▸ folds a folder.
+* **Folders:** *＋ Folder* creates a sub folder of the shown folder, *Rename*, *Move* and
+  *Delete* act on the shown folder. Folders can also be dragged onto another folder.
+* **Images:** click uses an image. Ctrl/Shift-click (or the check box) selects images;
+  then *Move to…* or *Delete*, or drag them onto a folder in the tree.
+* **Adding:** *⬆ Upload*, or drop files from the desktop into the image area or onto a
+  folder in the tree.
+* **Deleting** asks first and moves the files to the recycle bin (on macOS / Linux into
+  the library's hidden `.trash` folder).
+* Moving or deleting an image takes its mask, colour and shape files along. Nodes that
+  use a moved image follow it to the new place.
+
 Masks and colour are kept with the image, so they come back in every workflow (and
 for further editing in the MaskEditor): the MaskEditor mask as `<name>.mask.png`, the
 colour as `<name>.paint.png` and the rectangle or freehand shape as
-`<name>.shape.json`. The shape is also stored in the workflow. In the gallery the
-badges **M**, **P** and **S** show which of them an image has.
+`<name>.shape.json`. The badges **M**, **P** and **S** show which of them an image has.
 
 ## Where the library lives
 
 ```
 ComfyUI/user/cast_library/
-├── Persons/
-│   ├── Anna/
-│   │   ├── Face/
-│   │   └── Body/
-│   └── Tom/ …
-├── Accessories/
-└── Backgrounds/
+├── #TEMP/
+├── ACCESSORIES/
+├── BACKGROUNDS/
+├── CLOTHES/
+└── PERSONS/
+    └── Anna/
+        ├── Face/
+        └── Body/
 ```
 
-`Persons`, `Accessories` and `Backgrounds` are created on first start. Workflows store
-paths relative to this folder (e.g. `Persons/Anna/Face/anna_01.png`), so they keep
-working when ComfyUI is moved or reinstalled, as long as you copy the
-`user/cast_library` folder along.
-
-Any folder you create in Explorer shows up too: sub folders of a person or library are
-its areas. Images directly in a library folder appear as its *(main folder)* area.
-When you rename or delete an image in Explorer, rename or delete its `.mask.png` and
-`.shape.json` with it. The hidden `.thumbs` folder is a thumbnail cache and can be
-deleted at any time.
+The five top folders are created for a new library; everything below is up to you.
+Workflows store paths relative to this folder (e.g. `PERSONS/Anna/Face/anna_01.png`),
+so they keep working when ComfyUI is moved or reinstalled, as long as you copy the
+`user/cast_library` folder along. Folders made in Explorer show up as well. The hidden
+`.thumbs` folder is a thumbnail cache and can be deleted at any time.
 
 ## Install
 

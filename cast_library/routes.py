@@ -130,20 +130,43 @@ def register() -> None:
         await _run(lib.write_shape, lib.image_file(data.get("path", "")), data.get("data") or {})
         return web.json_response({"ok": True})
 
-    @routes.post(f"{PREFIX}/create")
+    @routes.post(f"{PREFIX}/folder/create")
     @_handler
-    async def create(request):
+    async def folder_create(request):
         data = await _json(request)
-        kind, name = data.get("kind"), data.get("name", "")
-        if kind == "person":
-            rel = await _run(lib.create_person, name)
-        elif kind == "library":
-            rel = await _run(lib.create_library, name)
-        elif kind == "area":
-            rel = await _run(lib.create_area, data.get("library", ""), name)
-        else:
-            raise lib.LibraryError(f"Unknown kind: {kind!r}")
-        return web.json_response({"path": rel})
+        return web.json_response({"path": await _run(lib.create_folder, data.get("parent", ""), data.get("name", ""))})
+
+    @routes.post(f"{PREFIX}/folder/rename")
+    @_handler
+    async def folder_rename(request):
+        data = await _json(request)
+        return web.json_response({"path": await _run(lib.rename_folder, data.get("path", ""), data.get("name", ""))})
+
+    @routes.post(f"{PREFIX}/folder/move")
+    @_handler
+    async def folder_move(request):
+        data = await _json(request)
+        return web.json_response({"path": await _run(lib.move_folder, data.get("path", ""), data.get("target", ""))})
+
+    @routes.post(f"{PREFIX}/folder/delete")
+    @_handler
+    async def folder_delete(request):
+        data = await _json(request)
+        await _run(lib.delete_folder, data.get("path", ""))
+        return web.json_response({"ok": True})
+
+    @routes.post(f"{PREFIX}/images/move")
+    @_handler
+    async def images_move(request):
+        data = await _json(request)
+        return web.json_response({"moved": await _run(lib.move_images, list(data.get("paths") or []), data.get("target", ""))})
+
+    @routes.post(f"{PREFIX}/images/delete")
+    @_handler
+    async def images_delete(request):
+        data = await _json(request)
+        await _run(lib.delete_images, list(data.get("paths") or []))
+        return web.json_response({"ok": True})
 
     @routes.post(f"{PREFIX}/upload")
     @_handler
