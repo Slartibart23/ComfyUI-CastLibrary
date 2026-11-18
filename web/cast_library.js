@@ -7,6 +7,7 @@ import {
   getTree, onTreeChange, flattenTree, onPathsMoved, uploadFiles, pickFiles, openInExplorer,
   newFolderDialog, openGallery,
 } from "./cast_library_ui.js";
+import { openComposer, parseComposition, renderComposition } from "./cast_library_compose.js";
 
 const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
@@ -72,6 +73,10 @@ function setupNode(node) {
   if (!pathWidget || !dataWidget) return;
   pathWidget.hidden = true;
   dataWidget.hidden = true;
+  const composeWidget = W("compose");
+  const composeDataWidget = W("compose_data");
+  if (composeDataWidget) composeDataWidget.hidden = true;
+  const composing = () => !!composeWidget?.value && !!composeDataWidget;
   node.properties ??= {};
 
   // ------------------------------------------------------------------ DOM
@@ -89,7 +94,8 @@ function setupNode(node) {
     const path = await newFolderDialog(currentDir());
     if (path) setDir(path);
   });
-  pickRow.append(folderSelect, bGallery, bUpload, bExplorer, bNew);
+  const bCompose = button("🧩 Compose", "Arrange several library images into one picture", () => openCompose(), "background:#7a4ab0;");
+  pickRow.append(folderSelect, bGallery, bCompose, bUpload, bExplorer, bNew);
 
   const bar = el("div", "display:flex;flex-wrap:wrap;align-items:center;gap:4px;font:12px sans-serif;color:var(--input-text,#ddd);min-height:22px;");
   const info = el("div", "font:11px sans-serif;color:var(--descrip-text,#999);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;");
@@ -156,6 +162,11 @@ function setupNode(node) {
   let message = "";
   let loadToken = 0;
   let wantedPath = null;    // path of the latest load request
+  let singleInfo = "";      // info line for the single image
+  let composeInfo = "";     // info line for the composition
+  let composeCanvas = null; // rendered preview of the composition
+  let composeToken = 0;
+  let lastComposeData = null;
   let drag = null;
   let hover = null;
   let pendingShape = null;  // shape loaded from the library for a freshly picked image
@@ -212,8 +223,51 @@ function setupNode(node) {
     }
     const dir = node.properties.castDir && remap(node.properties.castDir);
     if (dir) node.properties.castDir = dir;
+    if (composeDataWidget?.value) {
+      const comp = parseComposition(composeDataWidget.value);
+      let hit = false;
+      for (const l of comp.layers) { const np = remap(l.path); if (np) { l.path = np; hit = true; } }
+      const bg = comp.background.image && remap(comp.background.image);
+      if (bg) { comp.background.image = bg; hit = true; }
+      if (hit) { composeDataWidget.value = JSON.stringify(comp); renderComposePreview(); }
+    }
     node.setDirtyCanvas?.(true, true);
   });
+
+  // ------------------------------------------------------------ compose
+  function openCompose() {
+    openComposer({
+      data: parseComposition(composeDataWidget.value),
+      startDir: currentDir(),
+      onSave: (comp) => {
+        composeDataWidget.value = JSON.stringify(comp);
+        composeDataWidget.callback?.(composeDataWidget.value);
+        renderComposePreview();
+        node.setDirtyCanvas?.(true, true);
+      },
+    });
+  }
+
+  async function renderComposePreview() {
+    lastComposeData = composeDataWidget.value;
+    const comp = parseComposition(composeDataWidget.value);
+    const token = ++composeToken;
+    if (!comp.layers.length) {
+      composeCanvas = null;
+      composeInfo = "Composition is empty – click 🧩 Compose";
+      draw();
+      return;
+    }
+    const s = Math.min(1, 1024 / Math.max(comp.canvas.w, comp.canvas.h));
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(comp.canvas.w * s));
+    c.height = Math.max(1, Math.round(comp.canvas.h * s));
+    await renderComposition(c.getContext("2d"), comp, s);
+    if (token !== composeToken) return;
+    composeCanvas = c;
+    composeInfo = `Composition: ${comp.layers.length} image(s) · output ${Math.round(comp.canvas.w)}×${Math.round(comp.canvas.h)}`;
+    draw();
+  }
 
   // ---------------------------------------------------------- picking
   async function pick(path) {
@@ -255,7 +309,7 @@ function setupNode(node) {
     if (!path) {
       current = null; img = null; maskOverlay = null; paintLayer = null; meRef = null;
       message = "No image – click 🖼 Gallery";
-      info.textContent = "";
+      singleInfo = "";
       setNodeImages(null);
       draw();
       return;
@@ -278,7 +332,7 @@ function setupNode(node) {
       message = "";
       const [ow, oh] = limitedSize(img.naturalWidth, img.naturalHeight);
       const scaled = ow !== img.naturalWidth ? `  → ${ow}×${oh}` : "";
-      info.textContent = `${path.replaceAll("/", " › ")}  ${img.naturalWidth}×${img.naturalHeight}${scaled}`;
+      singleInfo = `${path.replaceAll("/", " › ")}  ${img.naturalWidth}×${img.naturalHeight}${scaled}`;
       info.title = path;
       await loadMaskOverlay(token);
       await loadPaintLayer(token);
@@ -288,7 +342,7 @@ function setupNode(node) {
       current = { path, v: "", mask: 0, paint: 0, shape: false };
       img = null; maskOverlay = null; paintLayer = null;
       message = String(e.message || e);
-      info.textContent = path;
+      singleInfo = path;
       setNodeImages(null);
     }
     draw();
@@ -518,11 +572,41 @@ function setupNode(node) {
     ctx.globalCompositeOperation = "source-over";
   }
 
+  function drawComposition() {
+    const dpr = window.devicePixelRatio || 1;
+    const cw = canvas.clientWidth, ch = canvas.clientHeight;
+    if (!cw || !ch) return;
+    canvas.width = Math.round(cw * dpr);
+    canvas.height = Math.round(ch * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+    if (!composeCanvas) {
+      ctx.fillStyle = "#888";
+      ctx.font = "12px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(composeInfo || "Loading…", cw / 2, ch / 2);
+      return;
+    }
+    const s = Math.min(cw / composeCanvas.width, ch / composeCanvas.height);
+    const w = composeCanvas.width * s, h = composeCanvas.height * s;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(composeCanvas, (cw - w) / 2, (ch - h) / 2, w, h);
+  }
+
   const shapeCanvas = document.createElement("canvas");
   const tintCanvas = document.createElement("canvas");
 
   function draw() {
     const m = mode();
+    const comp = composing();
+    bar.style.display = comp ? "none" : "flex";
+    bCompose.style.display = comp ? "" : "none";
+    info.textContent = comp ? composeInfo : singleInfo;
+    if (comp) {
+      drawComposition();
+      return;
+    }
     toolButtons.style.display = m === "freehand" ? "inline-flex" : "none";
     clearBtn.style.display = m === "rectangle" || m === "freehand" ? "" : "none";
     maskEditBtn.style.display = img ? "" : "none";
@@ -673,6 +757,10 @@ function setupNode(node) {
 
   // ------------------------------------------------------------ pointer
   canvas.addEventListener("pointerdown", (e) => {
+    if (composing()) {
+      if (e.button === 0) { e.stopPropagation(); openCompose(); }
+      return;
+    }
     const m = mode();
     const box = imageBox();
     if (!box || e.button !== 0) return;
@@ -825,7 +913,8 @@ function setupNode(node) {
       if (pathWidget.value && dirOf(pathWidget.value) !== node.properties.castDir) setDir(dirOf(pathWidget.value));
       loadCurrent();
     }
-    const look = `${mode()}|${W("fill_color")?.value}|${W("crop_to_mask")?.value}|${current?.mask}|${current?.paint}`;
+    if (composeDataWidget && composeDataWidget.value !== lastComposeData) renderComposePreview();
+    const look = `${mode()}|${W("fill_color")?.value}|${W("crop_to_mask")?.value}|${composing()}|${current?.mask}|${current?.paint}`;
     if (changed || look !== lastLook) {
       lastLook = look;
       draw();
@@ -845,6 +934,7 @@ function setupNode(node) {
     // workflows saved with 1.1.x stored the preview widget's "" where crop_to_mask is now
     const crop = W("crop_to_mask");
     if (crop && typeof crop.value !== "boolean") crop.value = true;
+    if (composeWidget && typeof composeWidget.value !== "boolean") composeWidget.value = false;
     data = parseData(dataWidget.value);
     lastDataValue = dataWidget.value;
     if (pathWidget.value) node.properties.castDir = dirOf(pathWidget.value);

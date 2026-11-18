@@ -23,6 +23,10 @@ Images whose longest side is larger than MAX_SIDE (2048 px) after the crop are
 scaled down proportionally to MAX_SIDE before the optional resize; the file in
 the library stays untouched.
 
+With compose on, the node instead outputs a composition of several library
+images (arranged like "Stitch Images" or freely placed, cropped and scaled in
+the composer window); its longest side is at most MAX_SIDE and the mask is empty.
+
 Resize and mask logic is taken from "Load & Resize Image + Filename"
 (Slartibart23), which is based on KJNodes LoadAndResizeImage by kijai
 (https://github.com/kijai/ComfyUI-KJNodes, GPL-3.0). This file is therefore
@@ -105,6 +109,17 @@ class CastLibraryLoadImage:
                                    "By Mask), before the size limit and resize. Without a mask nothing is cropped",
                     },
                 ),
+                "compose": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "label_on": "on",
+                        "label_off": "off",
+                        "tooltip": "Output a composition of several library images instead of one image. "
+                                   "Arrange it with the Compose button; the mask is empty",
+                    },
+                ),
+                "compose_data": ("STRING", {"default": "", "tooltip": "Written by the composer window"}),
             }
         }
 
@@ -259,11 +274,100 @@ class CastLibraryLoadImage:
         return out, shape_t.to(mask.dtype).unsqueeze(0).repeat(frames, 1, 1)
 
     # ------------------------------------------------------------------
+    # composition
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_compose(compose_data: str) -> dict:
+        try:
+            data = json.loads(compose_data or "{}")
+        except json.JSONDecodeError:
+            raise ValueError("compose_data is not valid JSON; open the composer and arrange the images again") from None
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _library_rgba(rel: str) -> Image.Image:
+        """Library image as RGBA (alpha kept) with the colour painted in the MaskEditor."""
+        full = lib.image_file(rel)
+        rgb, alpha = lib.open_rgb_alpha(full)
+        img = rgb.convert("RGBA")
+        if alpha is not None:
+            img.putalpha(alpha)
+        paint = lib.load_paint(full, img.size)
+        return Image.alpha_composite(img, paint) if paint is not None else img
+
+    @classmethod
+    def _compose(cls, compose_data: str):
+        """Render the composition; returns (image tensor, list of layer paths)."""
+        data = cls._parse_compose(compose_data)
+        layers = [l for l in data.get("layers") or [] if isinstance(l, dict) and l.get("path")]
+        if not layers:
+            raise ValueError("compose is on but the composition is empty: open Compose in the node and add images.")
+        canvas = data.get("canvas") or {}
+        cw, ch = max(1, int(canvas.get("w", 1024))), max(1, int(canvas.get("h", 1024)))
+        scale = min(1.0, MAX_SIDE / max(cw, ch))
+        out_w, out_h = max(1, round(cw * scale)), max(1, round(ch * scale))
+
+        background = data.get("background") or {}
+        color = str(background.get("color") or "#ffffff").lstrip("#")
+        try:
+            rgb = tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            rgb = (255, 255, 255)
+        out = Image.new("RGBA", (out_w, out_h), rgb + (255,))
+        if background.get("image"):
+            bg = cls._library_rgba(background["image"])
+            s = max(out_w / bg.width, out_h / bg.height)  # cover the canvas
+            bg = bg.resize((max(1, round(bg.width * s)), max(1, round(bg.height * s))), Image.Resampling.LANCZOS)
+            left, top = (bg.width - out_w) // 2, (bg.height - out_h) // 2
+            out.alpha_composite(bg.crop((left, top, left + out_w, top + out_h)))
+
+        for layer in layers:
+            img = cls._library_rgba(layer["path"])
+            cx, cy, crop_w, crop_h = (float(v) for v in layer.get("crop") or (0, 0, 1, 1))
+            box = (round(cx * img.width), round(cy * img.height),
+                   round((cx + crop_w) * img.width), round((cy + crop_h) * img.height))
+            if box[2] - box[0] < 1 or box[3] - box[1] < 1:
+                continue
+            img = img.crop(box)
+            w, h = round(float(layer["w"]) * scale), round(float(layer["h"]) * scale)
+            if w < 1 or h < 1:
+                continue
+            img = img.resize((w, h), Image.Resampling.LANCZOS)
+            out.paste(img, (round(float(layer["x"]) * scale), round(float(layer["y"]) * scale)), img)
+        return cls._pil_to_tensor(out.convert("RGB")), [l["path"] for l in layers]
+
+    # ------------------------------------------------------------------
     # main
     # ------------------------------------------------------------------
 
     def load_image(self, library_image, resize, width, height, keep_proportion, divisible_by,
-                   upscale_method, mask_source="MaskEditor", fill_color="yellow", crop_data="", crop_to_mask=True):
+                   upscale_method, mask_source="MaskEditor", fill_color="yellow", crop_data="", crop_to_mask=True,
+                   compose=False, compose_data=""):
+        if compose:
+            out_image, paths = self._compose(compose_data)
+            _, img_h, img_w, _ = out_image.shape
+            out_mask = torch.zeros((1, img_h, img_w), dtype=torch.float32)
+            described = [lib.describe(p) for p in paths]
+            filename_stem = ", ".join(os.path.splitext(os.path.basename(p))[0] for p in paths)
+            folder = ", ".join(d[0] for d in described)
+            folder_name = ", ".join(d[1] for d in described)
+        else:
+            out_image, out_mask, filename_stem, folder, folder_name = self._load_single(
+                library_image, mask_source, fill_color, crop_data, crop_to_mask)
+
+        if resize:
+            out_image, final_w, final_h = self._resize(out_image, width, height, keep_proportion,
+                                                       divisible_by, upscale_method)
+            mask_4d, _, _ = self._resize(out_mask.unsqueeze(-1), width, height, keep_proportion,
+                                         divisible_by, upscale_method)
+            out_mask = mask_4d.squeeze(-1)
+        else:
+            _, final_h, final_w, _ = out_image.shape
+
+        return out_image, out_mask, final_w, final_h, filename_stem, folder, folder_name
+
+    def _load_single(self, library_image, mask_source, fill_color, crop_data, crop_to_mask):
         image_path = lib.image_file(library_image)
         filename_stem = os.path.splitext(os.path.basename(image_path))[0]
         folder, folder_name = lib.describe(library_image)
@@ -294,27 +398,30 @@ class CastLibraryLoadImage:
         if crop_to_mask:
             out_image, out_mask = self._crop_to_mask(out_image, out_mask)
         out_image, out_mask = self._limit_size(out_image, out_mask)
-
-        if resize:
-            out_image, final_w, final_h = self._resize(out_image, width, height, keep_proportion,
-                                                       divisible_by, upscale_method)
-            mask_4d, _, _ = self._resize(out_mask.unsqueeze(-1), width, height, keep_proportion,
-                                         divisible_by, upscale_method)
-            out_mask = mask_4d.squeeze(-1)
-        else:
-            _, final_h, final_w, _ = out_image.shape
-
-        return out_image, out_mask, final_w, final_h, filename_stem, folder, folder_name
+        return out_image, out_mask, filename_stem, folder, folder_name
 
     # ------------------------------------------------------------------
     # cache / validation
     # ------------------------------------------------------------------
 
     @classmethod
-    def IS_CHANGED(cls, library_image, **kwargs):
+    def IS_CHANGED(cls, library_image, compose=False, compose_data="", **kwargs):
         try:
-            full = lib.image_file(library_image)
             h = hashlib.sha256()
+            if compose:
+                # the layout plus the state of every image in it
+                h.update((compose_data or "").encode())
+                data = cls._parse_compose(compose_data)
+                paths = [l.get("path") for l in data.get("layers") or [] if isinstance(l, dict)]
+                paths.append((data.get("background") or {}).get("image"))
+                for rel in filter(None, paths):
+                    full = lib.image_file(rel)
+                    for f in (full, lib.paint_path(full)):
+                        if os.path.isfile(f):
+                            st = os.stat(f)
+                            h.update(f"|{f}|{st.st_mtime_ns}|{st.st_size}".encode())
+                return h.hexdigest()
+            full = lib.image_file(library_image)
             with open(full, "rb") as f:
                 h.update(f.read())
             for kind, sidecar in (("mask", lib.mask_path(full)), ("paint", lib.paint_path(full))):
@@ -326,11 +433,20 @@ class CastLibraryLoadImage:
             return float("nan")
 
     @classmethod
-    def VALIDATE_INPUTS(cls, library_image, **kwargs):
-        if not (library_image or "").strip():
-            return "No library image selected: open the gallery in the node and pick an image."
+    def VALIDATE_INPUTS(cls, library_image, compose=False, compose_data="", **kwargs):
         try:
+            if compose:
+                data = cls._parse_compose(compose_data)
+                layers = [l for l in data.get("layers") or [] if isinstance(l, dict) and l.get("path")]
+                if not layers:
+                    return "compose is on but the composition is empty: open Compose in the node and add images."
+                background = (data.get("background") or {}).get("image")
+                for rel in [l["path"] for l in layers] + ([background] if background else []):
+                    lib.image_file(rel)
+                return True
+            if not (library_image or "").strip():
+                return "No library image selected: open the gallery in the node and pick an image."
             lib.image_file(library_image)
-        except lib.LibraryError as e:
+        except (lib.LibraryError, ValueError) as e:
             return str(e)
         return True

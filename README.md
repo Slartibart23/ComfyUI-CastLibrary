@@ -18,6 +18,7 @@ gallery and get it into your workflow as **image + mask** with optional crop and
 | resize, width, height, keep_proportion, divisible_by, upscale_method | Optional resize, same as *Load & Resize Image + Filename* |
 | mask_source | **MaskEditor**: the mask painted with the *Mask Editor* button (or right-click → Open in MaskEditor), stored with the library image; without one the image's alpha channel. **rectangle**: drag a rectangle in the preview. **freehand**: paint the area to keep (brush, lasso, eraser); outside it the image is filled with `fill_color` |
 | crop_to_mask | **on** (default): image and mask are cut to the bounding box of the mask, like KJNodes *Image Crop By Mask*, before the size limit and the resize. Without a mask nothing is cropped. In MaskEditor mode the preview shows the crop as a dashed frame. **off**: full image |
+| compose | **on**: the node outputs a composition of several images instead (see below), **🧩 Compose** opens the composer. **off** (default): one image |
 
 **Outputs:** `image`, `mask`, `width`, `height`, `filename` (without extension),
 `folder` (folder of the image, e.g. `PERSONS/Anna/Face`) and `folder_name` (`Face`).
@@ -29,6 +30,27 @@ crop, before the optional resize). The file in the library stays untouched.
 **Painting with colour:** in the MaskEditor, the paint brush (second tool) paints
 with a solid colour. That colour becomes part of the output image, in every
 `mask_source` mode, and is shown in the node preview. *Remove paint* deletes it again.
+
+## Compose: several images in one picture
+
+With `compose` on, **🧩 Compose** (or a click on the preview) opens the composer:
+
+* **＋ Add images** opens the gallery; every click adds an image, from any folder.
+* **Arrange** like *Stitch Images*: **Row** (same height side by side), **Column** (same
+  width stacked) or **Grid**, with **Spacing** between the images. The gaps show the
+  background.
+* Then place freely: drag to move, drag a corner to scale (aspect ratio kept), **✂** (or a
+  double-click) crops with the edge handles, **↑/↓** change the stacking order, **×** or
+  Del removes.
+* **Canvas:** 1:1, 3:4, 4:3, 16:9, 9:16, *fit content* (the canvas follows the images)
+  or *custom* width × height. **Background:** a colour and/or a library image that
+  covers the canvas.
+
+The composition is rendered from the original files (with colour painted in the
+MaskEditor and transparency of PNG cut-outs), its longest side is at most 2048 px, and
+the mask output is empty. `filename`, `folder` and `folder_name` list all images,
+separated by commas. The layout is saved in the workflow and can be edited again at any
+time; it follows images moved in the gallery.
 
 ## The gallery
 

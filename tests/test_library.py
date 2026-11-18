@@ -223,6 +223,63 @@ class LibraryTest(unittest.TestCase):
         self.assertEqual((tuple(img.shape), tuple(mask.shape), w, h), ((1, 60, 80, 3), (1, 60, 80), 80, 60))
         self.assertGreater(float(img[0, 30, 40, 0]), 0.9)
 
+    def test_compose(self):
+        try:
+            from cast_library.node import CastLibraryLoadImage
+        except Exception as e:
+            self.skipTest(f"node import failed: {e}")
+        import json
+        red = lib.save_upload("PERSONS", "red.png", png_bytes((100, 200), color=(255, 0, 0, 255), mode="RGB"))
+        blue = lib.save_upload("CLOTHES", "blue.png", png_bytes((100, 100), color=(0, 0, 255, 255), mode="RGB"))
+        sky = lib.save_upload("BACKGROUNDS", "sky.png", png_bytes((50, 50), color=(0, 255, 0, 255), mode="RGB"))
+        # half of a transparent cut-out shows what is below it
+        cut = Image.new("RGBA", (40, 40), (255, 255, 0, 255))
+        cut.paste((0, 0, 0, 0), (0, 0, 20, 40))
+        buf = BytesIO()
+        cut.save(buf, "PNG")
+        cutout = lib.save_upload("ACCESSORIES", "cut.png", buf.getvalue())
+        comp = {
+            "canvas": {"w": 400, "h": 200},
+            "background": {"color": "#ffffff", "image": None},
+            "layers": [
+                {"path": red, "x": 0, "y": 0, "w": 100, "h": 200, "crop": [0, 0, 1, 1]},
+                # right half of the blue image, 50x100 shown as 100x200
+                {"path": blue, "x": 200, "y": 0, "w": 100, "h": 200, "crop": [0.5, 0, 0.5, 1]},
+                {"path": cutout, "x": 0, "y": 0, "w": 40, "h": 40, "crop": [0, 0, 1, 1]},
+            ],
+        }
+        node = CastLibraryLoadImage()
+        img, mask, w, h, fname, folder, folder_name = node.load_image(
+            "", False, 512, 512, False, 32, "lanczos", compose=True, compose_data=json.dumps(comp))
+        self.assertEqual((tuple(img.shape), w, h), ((1, 200, 400, 3), 400, 200))
+        px = lambda x, y: [round(float(v), 2) for v in img[0, y, x]]
+        self.assertEqual(px(50, 100), [1.0, 0.0, 0.0])     # red
+        self.assertEqual(px(150, 100), [1.0, 1.0, 1.0])    # background between
+        self.assertEqual(px(250, 100), [0.0, 0.0, 1.0])    # blue
+        self.assertEqual(px(10, 20), [1.0, 0.0, 0.0])      # transparent half of the cut-out
+        self.assertEqual(px(30, 20), [1.0, 1.0, 0.0])      # opaque half
+        self.assertEqual(float(mask.max()), 0.0)
+        self.assertEqual(fname, "red, blue, cut")
+        self.assertEqual(folder, "PERSONS, CLOTHES, ACCESSORIES")
+        self.assertEqual(folder_name, "PERSONS, CLOTHES, ACCESSORIES")
+
+        # background image covers the canvas; larger canvases are limited to 2048 px
+        comp["background"]["image"] = sky
+        comp["canvas"] = {"w": 4000, "h": 2000}
+        comp["layers"] = [{"path": red, "x": 0, "y": 0, "w": 1000, "h": 2000, "crop": [0, 0, 1, 1]}]
+        img, _, w, h, *_ = node.load_image("", False, 512, 512, False, 32, "lanczos",
+                                           compose=True, compose_data=json.dumps(comp))
+        self.assertEqual((w, h), (2048, 1024))
+        self.assertEqual([round(float(v), 2) for v in img[0, 500, 1500]], [0.0, 1.0, 0.0])
+        self.assertEqual([round(float(v), 2) for v in img[0, 500, 200]], [1.0, 0.0, 0.0])
+
+        self.assertIs(CastLibraryLoadImage.VALIDATE_INPUTS("", compose=True, compose_data=json.dumps(comp)), True)
+        self.assertIsInstance(CastLibraryLoadImage.VALIDATE_INPUTS("", compose=True, compose_data=""), str)
+        comp["layers"][0]["path"] = "PERSONS/missing.png"
+        self.assertIsInstance(CastLibraryLoadImage.VALIDATE_INPUTS("", compose=True, compose_data=json.dumps(comp)), str)
+        with self.assertRaises(ValueError):
+            node.load_image("", False, 512, 512, False, 32, "lanczos", compose=True, compose_data="{}")
+
     def test_paint_goes_into_output_image(self):
         try:
             from cast_library.node import CastLibraryLoadImage

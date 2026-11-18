@@ -19,6 +19,7 @@ skaliert) in den Workflow.
 | resize, width, height, keep_proportion, divisible_by, upscale_method | Optionales Skalieren wie bei *Load & Resize Image + Filename* |
 | mask_source | **MaskEditor**: die mit dem Button *Mask Editor* (oder Rechtsklick → Open in MaskEditor) gemalte Maske, gespeichert beim Bild in der Bibliothek; ohne Maske der Alphakanal des Bildes. **rectangle**: Rechteck in der Vorschau aufziehen. **freehand**: den zu behaltenden Bereich malen (Pinsel, Lasso, Radierer), außerhalb wird mit `fill_color` gefüllt |
 | crop_to_mask | **on** (Standard): Bild und Maske werden auf das umschließende Rechteck der Maske zugeschnitten, wie mit KJNodes *Image Crop By Mask*, vor Größenbegrenzung und Resize. Ohne Maske wird nichts zugeschnitten. Im MaskEditor-Modus zeigt die Vorschau den Zuschnitt als gestrichelten Rahmen. **off**: ganzes Bild |
+| compose | **on**: Die Node gibt stattdessen eine Komposition aus mehreren Bildern aus (siehe unten), **🧩 Compose** öffnet den Composer. **off** (Standard): ein Bild |
 
 **Ausgänge:** `image`, `mask`, `width`, `height`, `filename` (ohne Endung),
 `folder` (Ordner des Bildes, z. B. `PERSONS/Anna/Face`) und `folder_name` (`Face`).
@@ -30,6 +31,28 @@ Zuschnitt, vor dem optionalen Resize). Die Datei in der Bibliothek bleibt unver�
 **Mit Farbe malen:** Im MaskEditor malt der Farbpinsel (zweites Werkzeug) mit einer
 Volltonfarbe. Diese Farbe wird Teil des Ausgabebildes, in jedem `mask_source`-Modus,
 und ist in der Vorschau der Node zu sehen. *Remove paint* entfernt sie wieder.
+
+## Compose: mehrere Bilder in einem Bild
+
+Ist `compose` an, öffnet **🧩 Compose** (oder ein Klick auf die Vorschau) den Composer:
+
+* **＋ Add images** öffnet die Galerie; jeder Klick fügt ein Bild hinzu, aus beliebigen
+  Ordnern.
+* **Arrange** wie bei *Stitch Images*: **Row** (gleiche Höhe nebeneinander), **Column**
+  (gleiche Breite untereinander) oder **Grid**, mit **Spacing** zwischen den Bildern. Die
+  Abstände zeigen den Hintergrund.
+* Danach frei anordnen: ziehen zum Verschieben, an einer Ecke ziehen zum Skalieren
+  (Seitenverhältnis bleibt), **✂** (oder Doppelklick) beschneidet mit den Kantengriffen,
+  **↑/↓** ändern die Reihenfolge, **×** oder Entf entfernt.
+* **Canvas:** 1:1, 3:4, 4:3, 16:9, 9:16, *fit content* (die Fläche richtet sich nach den
+  Bildern) oder *custom* Breite × Höhe. **Background:** eine Farbe und/oder ein
+  Bibliotheksbild, das die Fläche füllt.
+
+Die Komposition wird aus den Originaldateien berechnet (mit der im MaskEditor gemalten
+Farbe und der Transparenz freigestellter PNGs), ihre längste Seite ist höchstens
+2048 px, und der mask-Ausgang ist leer. `filename`, `folder` und `folder_name` nennen alle
+Bilder, durch Komma getrennt. Das Layout wird im Workflow gespeichert, lässt sich
+jederzeit wieder bearbeiten und folgt Bildern, die in der Galerie verschoben werden.
 
 ## Die Galerie
 

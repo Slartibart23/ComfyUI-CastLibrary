@@ -148,9 +148,16 @@ async function moveFolder(path, target) {
 }
 
 // ---------------------------------------------------------------- dialogs
-function modal(width) {
+// keys go to the topmost of our windows only (gallery over composer, dialog over gallery)
+export function isTopOverlay(overlay) {
+  const all = document.querySelectorAll("[data-cast-overlay]");
+  return all[all.length - 1] === overlay;
+}
+
+export function modal(width) {
   const overlay = el("div",
     "position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;");
+  overlay.dataset.castOverlay = "1";
   const panel = el("div",
     `background:var(--comfy-menu-bg,#222);color:var(--fg-color,#ddd);border:1px solid #444;border-radius:8px;` +
     `box-shadow:0 8px 40px rgba(0,0,0,0.6);font:13px sans-serif;${width}`);
@@ -247,15 +254,16 @@ function storePref(key, value) {
  * Opens the gallery window.
  *   startDir  folder to show first
  *   current   relative path of the image currently used by the node (highlighted)
- *   onPick(path)       an image was chosen (window closes)
+ *   onPick(path)       an image was chosen (window closes unless keepOpen)
  *   onDirChange(dir)   the shown folder changed (node follows it)
+ *   keepOpen           stay open after a pick (adding several images)
  */
-export async function openGallery({ startDir, current, onPick, onDirChange }) {
+export async function openGallery({ startDir, current, onPick, onDirChange, keepOpen = false }) {
   const { overlay, panel } = modal("width:min(1400px,95vw);height:90vh;display:flex;flex-direction:column;overflow:hidden;");
 
   // header
   const header = el("div", "display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #444;flex-wrap:wrap;");
-  const title = el("div", "font-weight:bold;font-size:14px;", "Cast Library");
+  const title = el("div", "font-weight:bold;font-size:14px;", keepOpen ? "Cast Library · click images to add them" : "Cast Library");
   const pathLabel = el("div", "color:#aaa;flex:1 1 auto;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
   const size = el("input", "width:110px;");
   Object.assign(size, { type: "range", min: 80, max: 320, value: loadPref("thumbSize", 150), title: "Thumbnail size" });
@@ -263,7 +271,10 @@ export async function openGallery({ startDir, current, onPick, onDirChange }) {
   const bExplorer = button("📂 Explorer", "Open the shown folder in Explorer", () => openInExplorer(dir));
   const bRefresh = button("⟳", "Reload", () => refresh());
   const bClose = button("✕", "Close (Esc)", () => close());
-  header.append(title, pathLabel, el("span", "color:#888;font-size:11px;", "Size"), size, bUpload, bExplorer, bRefresh, bClose);
+  const addedCount = el("span",
+    "display:none;padding:2px 10px;border-radius:10px;background:#1e8c3c;color:#fff;font:bold 12px sans-serif;");
+  const added = new Map(); // adding mode: path -> times added in this session
+  header.append(title, addedCount, pathLabel, el("span", "color:#888;font-size:11px;", "Size"), size, bUpload, bExplorer, bRefresh, bClose);
 
   // body: folder tree | images
   const body = el("div", "flex:1 1 auto;display:flex;min-height:0;");
@@ -357,7 +368,7 @@ export async function openGallery({ startDir, current, onPick, onDirChange }) {
     document.removeEventListener("keydown", onKey, true);
   }
   const onKey = (e) => {
-    if (e.key === "Escape" && !document.querySelector("[data-cast-dialog]")) {
+    if (e.key === "Escape" && isTopOverlay(overlay)) {
       e.preventDefault(); e.stopPropagation(); close();
     }
   };
@@ -470,6 +481,17 @@ export async function openGallery({ startDir, current, onPick, onDirChange }) {
     if (img.paint) badges.appendChild(badge("P", "Has colour painted in the MaskEditor", "#8a3ab0"));
     if (img.shape) badges.appendChild(badge("S", "Has a rectangle / freehand shape", "#2a7db0"));
     box.appendChild(badges);
+    // adding mode: images added in this session keep a green marker
+    const addedMark = el("div",
+      "position:absolute;left:0;right:0;bottom:0;padding:2px 0;background:rgba(30,140,60,0.9);color:#fff;" +
+      "font:bold 11px sans-serif;text-align:center;display:none;");
+    const showAdded = () => {
+      const n = added.get(img.path) || 0;
+      addedMark.style.display = n ? "block" : "none";
+      addedMark.textContent = n > 1 ? `✓ added ×${n}` : "✓ added";
+    };
+    showAdded();
+    box.appendChild(addedMark);
     const cap = el("div", "padding:3px 6px;font-size:11px;color:#ccc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;", img.name);
     cap.title = img.name;
     c.append(box, cap);
@@ -482,10 +504,35 @@ export async function openGallery({ startDir, current, onPick, onDirChange }) {
     c.addEventListener("mouseleave", () => { check.style.display = isSel || selected.size ? "block" : "none"; if (!isSel && !active) c.style.borderColor = "transparent"; });
     c.addEventListener("click", (e) => {
       if (e.ctrlKey || e.metaKey || e.shiftKey || selected.size) { toggle(img, e); return; }
-      close();
+      if (!keepOpen) close();
       onPick?.(img.path);
+      if (keepOpen) {
+        added.set(img.path, (added.get(img.path) || 0) + 1);
+        showAdded();
+        flashAdded(box);
+        updateAddedCount();
+      }
     });
     return c;
+  }
+
+  // big "Added!" over the clicked image, fading out
+  function flashAdded(box) {
+    const f = el("div",
+      "position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;" +
+      "background:rgba(30,140,60,0.75);color:#fff;font:bold 22px sans-serif;pointer-events:none;" +
+      "transition:opacity 0.6s ease 0.7s;opacity:1;", "");
+    f.append(el("div", "font-size:40px;line-height:1;", "✓"), el("div", null, "Added!"));
+    box.appendChild(f);
+    requestAnimationFrame(() => requestAnimationFrame(() => { f.style.opacity = "0"; }));
+    setTimeout(() => f.remove(), 1500);
+  }
+
+  function updateAddedCount() {
+    const total = [...added.values()].reduce((s, v) => s + v, 0);
+    addedCount.textContent = `✓ ${total} added`;
+    addedCount.style.display = total ? "" : "none";
+    addedCount.animate?.([{ transform: "scale(1.35)" }, { transform: "scale(1)" }], { duration: 300 });
   }
 
   function toggle(img, e) {
