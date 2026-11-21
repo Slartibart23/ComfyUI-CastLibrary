@@ -1,7 +1,8 @@
 // Cast Library composer: several library images on one canvas, arranged like
 // "Stitch Images" (row / column / grid with spacing) or placed freely, scaled
-// (aspect kept), cropped and stacked. The layout is stored as JSON in the
-// node's compose_data widget (canvas pixels, crops relative to the image).
+// (aspect kept), cropped and stacked, and painted over with solid colours.
+// The layout is stored as JSON in the node's compose_data widget (canvas
+// pixels, crops relative to the image; paint strokes in canvas pixels).
 
 import { el, notify, getJSON, libUrl, baseOf, button, openGallery, modal, isTopOverlay } from "./cast_library_ui.js";
 
@@ -14,12 +15,13 @@ export const emptyComposition = () => ({
   background: { color: "#ffffff", image: null },
   spacing: 16,
   layers: [],
+  paint: [], // strokes { t: brush|lasso|erase, c, o, s, h, p: [[x, y], ...] }
 });
 
 export function parseComposition(text) {
   try {
     const d = JSON.parse(text || "");
-    if (d && Array.isArray(d.layers) && d.canvas) return { ...emptyComposition(), ...d };
+    if (d && Array.isArray(d.layers) && d.canvas) return { ...emptyComposition(), ...d, paint: Array.isArray(d.paint) ? d.paint : [] };
   } catch {}
   return emptyComposition();
 }
@@ -62,7 +64,7 @@ export async function renderComposition(ctx, data, scale, ox = 0, oy = 0) {
   drawComposition(ctx, data, scale, ox, oy, entries, bg);
 }
 
-function drawComposition(ctx, data, scale, ox, oy, entries, bg) {
+function drawComposition(ctx, data, scale, ox, oy, entries, bg, liveStroke) {
   const W = data.canvas.w * scale, H = data.canvas.h * scale;
   ctx.save();
   ctx.beginPath();
@@ -87,7 +89,59 @@ function drawComposition(ctx, data, scale, ox, oy, entries, bg) {
       if (im) ctx.drawImage(im, cx * nw, cy * nh, cw * nw, ch * nh, ox + l.x * scale, oy + l.y * scale, l.w * scale, l.h * scale);
     }
   });
+  drawPaint(ctx, liveStroke ? [...data.paint, liveStroke] : data.paint, scale, ox, oy, W, H);
   ctx.restore();
+}
+
+// the paint strokes as one layer above the images (erase only removes paint);
+// same rendering as _apply_paint in node.py
+function drawPaint(ctx, strokes, scale, ox, oy, W, H) {
+  if (!strokes?.length) return;
+  const t = ctx.getTransform();
+  const d = t.a || 1; // device pixels per ctx unit
+  const layer = document.createElement("canvas");
+  layer.width = Math.max(1, Math.ceil(W * d));
+  layer.height = Math.max(1, Math.ceil(H * d));
+  const p = layer.getContext("2d");
+  const k = scale * d;
+  for (const st of strokes) {
+    const pts = st.p || [];
+    if (!pts.length || (st.t === "lasso" && pts.length < 3)) continue;
+    const size = Math.max(1, st.s) * k;
+    const blur = (1 - Math.min(Math.max(st.h ?? 1, 0), 1)) * size * 0.25;
+    p.save();
+    p.globalCompositeOperation = st.t === "erase" ? "destination-out" : "source-over";
+    p.globalAlpha = Math.min(Math.max(st.o ?? 1, 0), 1);
+    p.filter = blur > 0.3 ? `blur(${blur}px)` : "none";
+    p.fillStyle = p.strokeStyle = st.c || "#000000";
+    p.lineCap = p.lineJoin = "round";
+    p.beginPath();
+    p.moveTo(pts[0][0] * k, pts[0][1] * k);
+    for (const q of pts.slice(1)) p.lineTo(q[0] * k, q[1] * k);
+    if (st.t === "lasso") {
+      p.closePath();
+      p.fill();
+    } else if (pts.length === 1) {
+      p.arc(pts[0][0] * k, pts[0][1] * k, size / 2, 0, Math.PI * 2);
+      p.fill();
+    } else {
+      p.lineWidth = size;
+      p.stroke();
+    }
+    p.restore();
+  }
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(layer, ox * t.a + t.e, oy * t.d + t.f);
+  ctx.restore();
+}
+
+// keep the paint aligned when the whole layout is scaled / moved
+function transformPaint(data, s, dx, dy) {
+  for (const st of data.paint || []) {
+    st.p = st.p.map(([x, y]) => [x * s + dx, y * s + dy]);
+    st.s *= s;
+  }
 }
 
 // ---------------------------------------------------------------- layout
@@ -106,6 +160,7 @@ function refitLayers(data, nw, nh) {
   const s = Math.min(nw / ow, nh / oh);
   const dx = (nw - ow * s) / 2, dy = (nh - oh * s) / 2;
   for (const l of data.layers) Object.assign(l, { x: l.x * s + dx, y: l.y * s + dy, w: l.w * s, h: l.h * s });
+  transformPaint(data, s, dx, dy);
   Object.assign(data.canvas, { w: nw, h: nh });
 }
 
@@ -118,6 +173,7 @@ function fitCanvas(data) {
   const w = x1 - x0, h = y1 - y0;
   const s = Math.min(1, MAX_SIDE / Math.max(w, h));
   if (s < 1) for (const l of data.layers) Object.assign(l, { x: l.x * s, y: l.y * s, w: l.w * s, h: l.h * s });
+  transformPaint(data, s, -x0 * s, -y0 * s);
   Object.assign(data.canvas, { w: Math.max(1, Math.round(w * s)), h: Math.max(1, Math.round(h * s)) });
 }
 
@@ -182,6 +238,22 @@ function arrange(data, entries, mode) {
   data.arrange = mode;
 }
 
+// adds images to a composition (e.g. dropped on the node): arranged like the
+// last arrangement, otherwise centred at a third of the canvas size
+export async function appendLayers(data, paths) {
+  const entries = await Promise.all(data.layers.map((l) => loadLayerImage(l.path).catch(() => null)));
+  for (const path of paths) {
+    const entry = await loadLayerImage(path);
+    const [nw, nh] = natural(entry);
+    const s = Math.min(data.canvas.w / 3 / nw, data.canvas.h / 3 / nh);
+    data.layers.push({ path, x: (data.canvas.w - nw * s) / 2, y: (data.canvas.h - nh * s) / 2, w: nw * s, h: nh * s, crop: [0, 0, 1, 1] });
+    entries.push(entry);
+  }
+  if (data.arrange && entries.every(Boolean)) arrange(data, entries, data.arrange);
+  else if (data.canvas.preset === "fit") fitCanvas(data);
+  return data;
+}
+
 // ---------------------------------------------------------------- window
 /**
  * Opens the composer.
@@ -216,7 +288,10 @@ export async function openComposer({ data: initial, startDir, onSave }) {
   const sizeInfo = el("span", "color:#9ab;font-size:12px;margin-left:auto;");
   const bDone = button("Done", "Use this composition", () => { close(); onSave?.(data); }, "background:#2a6db0;");
   const bCancel = button("Cancel", "Discard the changes", () => close());
+  const bArrangeMode = button("✥ Arrange", "Move, scale and crop the images", () => setMode("arrange"));
+  const bPaintMode = button("🖌 Paint", "Paint over the composition with solid colours", () => setMode("paint"));
   bar.append(
+    bArrangeMode, bPaintMode,
     label("Canvas"), presetSel, wIn, el("span", null, "×"), hIn,
     label("Arrange"),
     button("▭▭ Row", "Side by side, same height (like Stitch Images → right)", () => doArrange("row")),
@@ -226,6 +301,48 @@ export async function openComposer({ data: initial, startDir, onSave }) {
     label("Background"), colorIn, bBg, bgName, bBgClear,
     sizeInfo, bCancel, bDone,
   );
+
+  // ---- paint bar (paint mode)
+  const paintBar = el("div", "display:none;flex-wrap:wrap;align-items:center;gap:6px;padding:6px 12px;border-bottom:1px solid #444;background:#1d2430;");
+  const tools = {};
+  const toolBtn = (key, text, tip) => (tools[key] = button(text, tip, () => setTool(key)));
+  const paintColor = el("input", "width:34px;height:22px;padding:0;border:1px solid #555;background:none;");
+  Object.assign(paintColor, { type: "color", value: "#e03030" });
+  const slider = (min, max, step, value, tip) => {
+    const r = el("input", "width:90px;");
+    Object.assign(r, { type: "range", min, max, step, value, title: tip });
+    return r;
+  };
+  const sizeIn = slider(2, 400, 1, 40, "Brush size (canvas pixels)");
+  const opacityIn = slider(0.05, 1, 0.05, 1, "Opacity");
+  const hardIn = slider(0, 1, 0.05, 1, "Hardness (lower = softer edge)");
+  const sizeVal = el("span", "color:#ccc;font-size:11px;width:30px;");
+  const showVals = () => { sizeVal.textContent = sizeIn.value; };
+  sizeIn.addEventListener("input", () => { showVals(); draw(); });
+  let clearedPaint = null; // undo after Clear
+  paintBar.append(
+    toolBtn("brush", "Brush", "Paint with the colour"),
+    toolBtn("lasso", "Lasso", "Draw an outline, it is filled with the colour"),
+    toolBtn("erase", "Eraser", "Remove paint (the images stay)"),
+    toolBtn("pick", "Pipette", "Take a colour from the composition"),
+    label("Colour"), paintColor,
+    label("Size"), sizeIn, sizeVal,
+    label("Opacity"), opacityIn,
+    label("Hardness"), hardIn,
+    button("Undo", "Undo the last stroke", () => {
+      if (data.paint.length) data.paint.pop();
+      else if (clearedPaint) { data.paint = clearedPaint; clearedPaint = null; }
+      draw();
+    }),
+    button("Clear", "Remove all paint", () => {
+      if (!data.paint.length) return;
+      clearedPaint = data.paint;
+      data.paint = [];
+      draw();
+    }),
+    el("span", "color:#9ab;font-size:11px;", "Paint stays on the canvas – arrange first, then paint"),
+  );
+  showVals();
 
   // ---- stage + layer list
   const body = el("div", "flex:1 1 auto;display:flex;min-height:0;");
@@ -243,7 +360,7 @@ export async function openComposer({ data: initial, startDir, onSave }) {
     "Drag to move · corner handles scale (aspect kept) · ✂ crops with the edge handles · Del removes");
   side.append(sideBar, list, hint);
   body.append(stageBox, side);
-  panel.append(bar, body);
+  panel.append(bar, paintBar, body);
 
   // ---- state
   let entries = [];   // loaded images, parallel to data.layers
@@ -252,6 +369,25 @@ export async function openComposer({ data: initial, startDir, onSave }) {
   let cropMode = false;
   let drag = null;
   let view = { k: 1, ox: 0, oy: 0 };
+  let mode = "arrange";
+  let tool = "brush";
+  let stroke = null; // paint stroke being drawn
+  let hover = null;
+
+  function setMode(m) {
+    mode = m;
+    cropMode = false;
+    paintBar.style.display = m === "paint" ? "flex" : "none";
+    bArrangeMode.style.background = m === "arrange" ? "#2a6db0" : "#333";
+    bPaintMode.style.background = m === "paint" ? "#2a6db0" : "#333";
+    draw();
+  }
+
+  function setTool(t) {
+    tool = t;
+    for (const [k, b] of Object.entries(tools)) b.style.background = k === t ? "#2a6db0" : "#333";
+    draw();
+  }
 
   function close() {
     overlay.remove();
@@ -261,7 +397,7 @@ export async function openComposer({ data: initial, startDir, onSave }) {
   // Escape does not close the composer (work would be lost); Cancel / Done do
   const onKey = (e) => {
     if (!isTopOverlay(overlay) || e.target instanceof HTMLInputElement) return;
-    if ((e.key === "Delete" || e.key === "Backspace") && selected >= 0) { e.preventDefault(); e.stopPropagation(); removeLayer(selected); }
+    if (mode === "arrange" && (e.key === "Delete" || e.key === "Backspace") && selected >= 0) { e.preventDefault(); e.stopPropagation(); removeLayer(selected); }
   };
   document.addEventListener("keydown", onKey, true);
 
@@ -412,7 +548,26 @@ export async function openComposer({ data: initial, startDir, onSave }) {
     // checkerboard-ish frame so the canvas edge is visible
     ctx.fillStyle = "#000";
     ctx.fillRect(view.ox - 1, view.oy - 1, data.canvas.w * k + 2, data.canvas.h * k + 2);
-    drawComposition(ctx, data, k, view.ox, view.oy, entries, bgEntry);
+    drawComposition(ctx, data, k, view.ox, view.oy, entries, bgEntry, stroke);
+
+    if (mode === "paint") {
+      if (hover && (tool === "brush" || tool === "erase")) {
+        ctx.strokeStyle = tool === "erase" ? "#f66" : "#fff";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(hover.sx, hover.sy, Math.max(1, (Number(sizeIn.value) * k) / 2), 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      if (stroke?.t === "lasso" && stroke.p.length > 1) {
+        ctx.strokeStyle = "#fff";
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        stroke.p.forEach(([x, y], i) => (i ? ctx.lineTo : ctx.moveTo).call(ctx, view.ox + x * k, view.oy + y * k));
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      return;
+    }
 
     const l = data.layers[selected];
     if (!l) return;
@@ -463,6 +618,22 @@ export async function openComposer({ data: initial, startDir, onSave }) {
   stage.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
     const p = pointer(e);
+    if (mode === "paint") {
+      if (tool === "pick") {
+        const dpr = window.devicePixelRatio || 1;
+        const px = stage.getContext("2d").getImageData(Math.round(p.sx * dpr), Math.round(p.sy * dpr), 1, 1).data;
+        paintColor.value = "#" + [px[0], px[1], px[2]].map((v) => v.toString(16).padStart(2, "0")).join("");
+        setTool("brush");
+        return;
+      }
+      stroke = {
+        t: tool, c: paintColor.value, o: Number(opacityIn.value), s: Number(sizeIn.value),
+        h: Number(hardIn.value), p: [[p.x, p.y]],
+      };
+      stage.setPointerCapture(e.pointerId);
+      draw();
+      return;
+    }
     const sel = data.layers[selected];
     if (sel) {
       const hit = handles(screenRect(sel)).find(([, hx, hy]) => Math.abs(p.sx - hx) <= HANDLE && Math.abs(p.sy - hy) <= HANDLE);
@@ -490,6 +661,16 @@ export async function openComposer({ data: initial, startDir, onSave }) {
 
   stage.addEventListener("pointermove", (e) => {
     const p = pointer(e);
+    if (mode === "paint") {
+      hover = p;
+      stage.style.cursor = tool === "brush" || tool === "erase" ? "none" : "crosshair";
+      if (stroke) {
+        const last = stroke.p[stroke.p.length - 1];
+        if (Math.hypot((p.x - last[0]) * view.k, (p.y - last[1]) * view.k) >= 1.5) stroke.p.push([p.x, p.y]);
+      }
+      draw();
+      return;
+    }
     if (!drag) {
       const sel = data.layers[selected];
       const hit = sel && handles(screenRect(sel)).find(([, hx, hy]) => Math.abs(p.sx - hx) <= HANDLE && Math.abs(p.sy - hy) <= HANDLE);
@@ -536,6 +717,14 @@ export async function openComposer({ data: initial, startDir, onSave }) {
   }
 
   const endDrag = () => {
+    if (stroke) {
+      stroke.p = stroke.p.map(([x, y]) => [Math.round(x * 10) / 10, Math.round(y * 10) / 10]);
+      if (stroke.t !== "lasso" || stroke.p.length >= 3) data.paint.push(stroke);
+      stroke = null;
+      clearedPaint = null;
+      draw();
+      return;
+    }
     if (!drag) return;
     drag = null;
     data.arrange = null; // hand-placed now
@@ -543,13 +732,16 @@ export async function openComposer({ data: initial, startDir, onSave }) {
   };
   stage.addEventListener("pointerup", endDrag);
   stage.addEventListener("pointercancel", endDrag);
-  stage.addEventListener("dblclick", () => { if (selected >= 0) { cropMode = !cropMode; renderList(); draw(); } });
+  stage.addEventListener("pointerleave", () => { hover = null; if (mode === "paint") draw(); });
+  stage.addEventListener("dblclick", () => { if (mode === "arrange" && selected >= 0) { cropMode = !cropMode; renderList(); draw(); } });
 
   const ro = new ResizeObserver(() => draw());
   ro.observe(stageBox);
 
   syncInputs();
   renderList();
+  setMode("arrange");
+  setTool("brush");
   await loadEntries();
   if (data.layers.some((l, i) => !entries[i])) notify("Some images of this composition are missing in the library.");
   draw();

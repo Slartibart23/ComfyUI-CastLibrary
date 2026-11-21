@@ -15,6 +15,7 @@ gallery and get it into your workflow as **image + mask** with optional crop and
 | ⬆ | Upload images into the selected folder. You can also drop files onto the node |
 | 📂 | Opens the selected folder in Explorer |
 | ＋ | New folder inside the selected folder |
+| 💾 Drop: save / ⏳ Drop: temp | What happens to images dropped onto the node. **save** (off): they are stored in the selected folder. **temp** (on): they are used without saving them in the library (kept in `input/cast_library_drops`, the same image dropped again is reused). In compose mode dropped images are added to the composition |
 | resize, width, height, keep_proportion, divisible_by, upscale_method | Optional resize, same as *Load & Resize Image + Filename* |
 | mask_source | **MaskEditor**: the mask painted with the *Mask Editor* button (or right-click → Open in MaskEditor), stored with the library image; without one the image's alpha channel. **rectangle**: drag a rectangle in the preview. **freehand**: paint the area to keep (brush, lasso, eraser); outside it the image is filled with `fill_color` |
 | crop_to_mask | **on** (default): image and mask are cut to the bounding box of the mask, like KJNodes *Image Crop By Mask*, before the size limit and the resize. Without a mask nothing is cropped. In MaskEditor mode the preview shows the crop as a dashed frame. **off**: full image |
@@ -45,9 +46,13 @@ With `compose` on, **🧩 Compose** (or a click on the preview) opens the compos
 * **Canvas:** 1:1, 3:4, 4:3, 16:9, 9:16, *fit content* (the canvas follows the images)
   or *custom* width × height. **Background:** a colour and/or a library image that
   covers the canvas.
+* **🖌 Paint** paints over the composition with solid colours: **Brush**, **Lasso** (fills
+  an outline), **Eraser** (removes paint only), **Pipette** (takes a colour from the
+  composition), with size, opacity and hardness (soft edges), **Undo** and **Clear**. The
+  paint belongs to the canvas, not to an image: arrange first, then paint.
 
 The composition is rendered from the original files (with colour painted in the
-MaskEditor and transparency of PNG cut-outs), its longest side is at most 2048 px, and
+MaskEditor and transparency of PNG cut-outs) plus the paint, its longest side is at most 2048 px, and
 the mask output is empty. `filename`, `folder` and `folder_name` list all images,
 separated by commas. The layout is saved in the workflow and can be edited again at any
 time; it follows images moved in the gallery.

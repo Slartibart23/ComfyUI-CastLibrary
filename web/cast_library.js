@@ -7,7 +7,7 @@ import {
   getTree, onTreeChange, flattenTree, onPathsMoved, uploadFiles, pickFiles, openInExplorer,
   newFolderDialog, openGallery,
 } from "./cast_library_ui.js";
-import { openComposer, parseComposition, renderComposition } from "./cast_library_compose.js";
+import { openComposer, parseComposition, renderComposition, appendLayers } from "./cast_library_compose.js";
 
 const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
@@ -95,7 +95,19 @@ function setupNode(node) {
     if (path) setDir(path);
   });
   const bCompose = button("🧩 Compose", "Arrange several library images into one picture", () => openCompose(), "background:#7a4ab0;");
-  pickRow.append(folderSelect, bGallery, bCompose, bUpload, bExplorer, bNew);
+  // drag & drop: save the dropped images in the selected folder, or use them
+  // without saving them in the library ("@drop/..." in input/cast_library_drops)
+  const dropTemp = () => !!node.properties.castDropTemp;
+  const bDrop = button("", "", () => { node.properties.castDropTemp = !dropTemp(); renderDropButton(); });
+  function renderDropButton() {
+    bDrop.textContent = dropTemp() ? "⏳ Drop: temp" : "💾 Drop: save";
+    bDrop.title = dropTemp()
+      ? "On: images dropped on the node are used without saving them in the library"
+      : "Off: images dropped on the node are saved in the selected folder";
+    bDrop.style.background = dropTemp() ? "#8a6414" : "#333";
+  }
+  renderDropButton();
+  pickRow.append(folderSelect, bGallery, bCompose, bUpload, bExplorer, bNew, bDrop);
 
   const bar = el("div", "display:flex;flex-wrap:wrap;align-items:center;gap:4px;font:12px sans-serif;color:var(--input-text,#ddd);min-height:22px;");
   const info = el("div", "font:11px sans-serif;color:var(--descrip-text,#999);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;");
@@ -273,7 +285,7 @@ function setupNode(node) {
   async function pick(path) {
     pathWidget.value = path;
     pathWidget.callback?.(path);
-    node.properties.castDir = dirOf(path);
+    if (!path.startsWith("@drop/")) node.properties.castDir = dirOf(path);
     renderSelects();
     pendingShape = true; // take the shape stored with the image
     await loadCurrent(true);
@@ -289,12 +301,20 @@ function setupNode(node) {
     });
   }
 
-  async function handleUpload(files) {
+  async function handleUpload(files, dropped = false) {
     if (!files?.length) return;
     try {
-      const paths = await uploadFiles(currentDir(), files);
-      notify(`${paths.length} image(s) added to ${folderLabel(currentDir())}`, "success");
-      if (paths.length === 1) await pick(paths[0]);
+      const temp = dropped && dropTemp();
+      const paths = await uploadFiles(temp ? "@drop" : currentDir(), files);
+      notify(temp ? `${paths.length} image(s) used without saving them in the library`
+        : `${paths.length} image(s) added to ${folderLabel(currentDir())}`, "success");
+      if (composing()) {
+        const comp = await appendLayers(parseComposition(composeDataWidget.value), paths);
+        composeDataWidget.value = JSON.stringify(comp);
+        renderComposePreview();
+      } else if (paths.length === 1) {
+        await pick(paths[0]);
+      }
     } catch (e) {
       notify(e.message);
     }
@@ -332,7 +352,8 @@ function setupNode(node) {
       message = "";
       const [ow, oh] = limitedSize(img.naturalWidth, img.naturalHeight);
       const scaled = ow !== img.naturalWidth ? `  → ${ow}×${oh}` : "";
-      singleInfo = `${path.replaceAll("/", " › ")}  ${img.naturalWidth}×${img.naturalHeight}${scaled}`;
+      const where = path.startsWith("@drop/") ? `⏳ not saved in the library › ${baseOf(path)}` : path.replaceAll("/", " › ");
+      singleInfo = `${where}  ${img.naturalWidth}×${img.naturalHeight}${scaled}`;
       info.title = path;
       await loadMaskOverlay(token);
       await loadPaintLayer(token);
@@ -861,7 +882,8 @@ function setupNode(node) {
   let dragDepth = 0;
   const showDrop = (on) => {
     dropHint.style.display = on ? "flex" : "none";
-    dropHint.textContent = `Add to ${folderLabel(currentDir()).replaceAll("/", " › ")}`;
+    dropHint.textContent = dropTemp() ? "Use without saving in the library"
+      : `Add to ${folderLabel(currentDir()).replaceAll("/", " › ")}`;
   };
   wrapper.addEventListener("dragenter", (e) => { if (!hasFiles(e)) return; e.preventDefault(); dragDepth++; showDrop(true); });
   wrapper.addEventListener("dragover", (e) => { if (hasFiles(e)) { e.preventDefault(); e.stopPropagation(); } });
@@ -872,13 +894,13 @@ function setupNode(node) {
     e.stopPropagation();
     dragDepth = 0;
     showDrop(false);
-    handleUpload(e.dataTransfer.files);
+    handleUpload(e.dataTransfer.files, true);
   });
   // files dropped on the node outside the DOM part
   node.onDragOver = (e) => hasFiles(e);
   node.onDragDrop = (e) => {
     if (!hasFiles(e)) return false;
-    handleUpload(e.dataTransfer.files);
+    handleUpload(e.dataTransfer.files, true);
     return true;
   };
 
@@ -910,7 +932,7 @@ function setupNode(node) {
     watchNodeImages();
     const changed = syncFromWidget();
     if ((pathWidget.value || "") !== wantedPath) {
-      if (pathWidget.value && dirOf(pathWidget.value) !== node.properties.castDir) setDir(dirOf(pathWidget.value));
+      if (pathWidget.value && !pathWidget.value.startsWith("@drop/") && dirOf(pathWidget.value) !== node.properties.castDir) setDir(dirOf(pathWidget.value));
       loadCurrent();
     }
     if (composeDataWidget && composeDataWidget.value !== lastComposeData) renderComposePreview();
@@ -937,8 +959,9 @@ function setupNode(node) {
     if (composeWidget && typeof composeWidget.value !== "boolean") composeWidget.value = false;
     data = parseData(dataWidget.value);
     lastDataValue = dataWidget.value;
-    if (pathWidget.value) node.properties.castDir = dirOf(pathWidget.value);
+    if (pathWidget.value && !pathWidget.value.startsWith("@drop/")) node.properties.castDir = dirOf(pathWidget.value);
     renderSelects();
+    renderDropButton();
     return r;
   };
 

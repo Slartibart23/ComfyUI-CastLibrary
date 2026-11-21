@@ -16,6 +16,7 @@ skaliert) in den Workflow.
 | ⬆ | Bilder in den gewählten Ordner hochladen. Dateien können auch auf die Node gezogen werden |
 | 📂 | Öffnet den gewählten Ordner im Explorer |
 | ＋ | Neuer Unterordner im gewählten Ordner |
+| 💾 Drop: save / ⏳ Drop: temp | Was mit Bildern passiert, die auf die Node gezogen werden. **save** (aus): Sie werden im gewählten Ordner gespeichert. **temp** (an): Sie werden verwendet, ohne sie in der Bibliothek zu speichern (abgelegt in `input/cast_library_drops`, dasselbe Bild wird beim erneuten Reinziehen wiederverwendet). Im Compose-Modus kommen reingezogene Bilder in die Komposition |
 | resize, width, height, keep_proportion, divisible_by, upscale_method | Optionales Skalieren wie bei *Load & Resize Image + Filename* |
 | mask_source | **MaskEditor**: die mit dem Button *Mask Editor* (oder Rechtsklick → Open in MaskEditor) gemalte Maske, gespeichert beim Bild in der Bibliothek; ohne Maske der Alphakanal des Bildes. **rectangle**: Rechteck in der Vorschau aufziehen. **freehand**: den zu behaltenden Bereich malen (Pinsel, Lasso, Radierer), außerhalb wird mit `fill_color` gefüllt |
 | crop_to_mask | **on** (Standard): Bild und Maske werden auf das umschließende Rechteck der Maske zugeschnitten, wie mit KJNodes *Image Crop By Mask*, vor Größenbegrenzung und Resize. Ohne Maske wird nichts zugeschnitten. Im MaskEditor-Modus zeigt die Vorschau den Zuschnitt als gestrichelten Rahmen. **off**: ganzes Bild |
@@ -47,9 +48,13 @@ Ist `compose` an, öffnet **🧩 Compose** (oder ein Klick auf die Vorschau) den
 * **Canvas:** 1:1, 3:4, 4:3, 16:9, 9:16, *fit content* (die Fläche richtet sich nach den
   Bildern) oder *custom* Breite × Höhe. **Background:** eine Farbe und/oder ein
   Bibliotheksbild, das die Fläche füllt.
+* **🖌 Paint** malt mit Volltonfarben über die Komposition: **Brush**, **Lasso** (füllt
+  eine Umrandung), **Eraser** (entfernt nur Farbe), **Pipette** (nimmt eine Farbe aus der
+  Komposition), mit Größe, Deckkraft und Härte (weiche Kanten), **Undo** und **Clear**.
+  Die Farbe gehört zur Fläche, nicht zu einem Bild: erst anordnen, dann malen.
 
 Die Komposition wird aus den Originaldateien berechnet (mit der im MaskEditor gemalten
-Farbe und der Transparenz freigestellter PNGs), ihre längste Seite ist höchstens
+Farbe und der Transparenz freigestellter PNGs) samt Malerei, ihre längste Seite ist höchstens
 2048 px, und der mask-Ausgang ist leer. `filename`, `folder` und `folder_name` nennen alle
 Bilder, durch Komma getrennt. Das Layout wird im Workflow gespeichert, lässt sich
 jederzeit wieder bearbeiten und folgt Bildern, die in der Galerie verschoben werden.

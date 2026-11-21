@@ -280,6 +280,78 @@ class LibraryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             node.load_image("", False, 512, 512, False, 32, "lanczos", compose=True, compose_data="{}")
 
+    def test_compose_paint(self):
+        try:
+            from cast_library.node import CastLibraryLoadImage
+        except Exception as e:
+            self.skipTest(f"node import failed: {e}")
+        import json
+        img = lib.save_upload("PERSONS", "white.png", png_bytes((100, 100), color=(255, 255, 255, 255), mode="RGB"))
+        comp = {
+            "canvas": {"w": 200, "h": 100},
+            "background": {"color": "#000000"},
+            "layers": [{"path": img, "x": 0, "y": 0, "w": 100, "h": 100, "crop": [0, 0, 1, 1]}],
+            "paint": [
+                # red line across the whole width, 20 px thick
+                {"t": "brush", "c": "#ff0000", "o": 1, "s": 20, "h": 1, "p": [[0, 50], [200, 50]]},
+                # half transparent blue filled square on the right
+                {"t": "lasso", "c": "#0000ff", "o": 0.5, "s": 1, "h": 1, "p": [[150, 0], [199, 0], [199, 30], [150, 30]]},
+                # eraser removes the red line again on the left image, the image stays
+                {"t": "erase", "c": "#000000", "o": 1, "s": 30, "h": 1, "p": [[20, 50], [40, 50]]},
+                # soft brush: centre full colour, edge faded
+                {"t": "brush", "c": "#00ff00", "o": 1, "s": 20, "h": 0, "p": [[100, 85]]},
+            ],
+        }
+        out, *_ = CastLibraryLoadImage().load_image("", False, 512, 512, False, 32, "lanczos",
+                                                     compose=True, compose_data=json.dumps(comp))
+        px = lambda x, y: [round(float(v), 2) for v in out[0, y, x]]
+        self.assertEqual(px(70, 50), [1.0, 0.0, 0.0])    # red over the white image
+        self.assertEqual(px(120, 50), [1.0, 0.0, 0.0])   # red over the background
+        self.assertEqual(px(30, 50), [1.0, 1.0, 1.0])    # erased: the white image again
+        self.assertEqual(px(70, 20), [1.0, 1.0, 1.0])    # untouched image
+        self.assertEqual(px(170, 10), [0.0, 0.0, 0.5])   # 50 % blue over black
+        green_center, green_edge = float(out[0, 85, 100, 1]), float(out[0, 85, 109, 1])
+        self.assertGreater(green_center, 0.5)
+        self.assertLess(green_edge, green_center)
+        # the 2048 px limit scales the strokes along
+        comp["canvas"] = {"w": 4096, "h": 2048}
+        comp["layers"] = []
+        comp["layers"].append({"path": img, "x": 0, "y": 0, "w": 10, "h": 10, "crop": [0, 0, 1, 1]})
+        comp["paint"] = [{"t": "brush", "c": "#ff0000", "o": 1, "s": 40, "h": 1, "p": [[2000, 1000]]}]
+        out, _, w, h, *_ = CastLibraryLoadImage().load_image("", False, 512, 512, False, 32, "lanczos",
+                                                             compose=True, compose_data=json.dumps(comp))
+        self.assertEqual((w, h), (2048, 1024))
+        self.assertEqual([round(float(v), 2) for v in out[0, 500, 1000]], [1.0, 0.0, 0.0])
+        self.assertEqual([round(float(v), 2) for v in out[0, 500, 1015]], [0.0, 0.0, 0.0])
+
+    def test_dropped_images_outside_the_library(self):
+        a = lib.save_upload("@drop", "photo.png", png_bytes())
+        self.assertRegex(a, r"^@drop/photo_[0-9a-f]{10}\.png$")
+        self.assertEqual(lib.save_upload("@drop", "photo.png", png_bytes()), a)  # same content: reused
+        b = lib.save_upload("@drop", "photo.png", png_bytes(color=(0, 255, 0, 255)))
+        self.assertNotEqual(a, b)
+        full = lib.image_file(a)
+        self.assertEqual(os.path.dirname(full), os.path.join(self.tmp, "input", "cast_library_drops"))
+        self.assertEqual(lib.to_rel(full), a)
+        self.assertEqual(lib.describe(a), ("", ""))
+        self.assertEqual(lib.image_info(full)["path"], a)
+        self.assertTrue(os.path.isfile(lib.thumbnail(a)))
+        # not part of the library tree, and cannot be managed as a folder
+        names = [c["name"] for c in lib.tree()["tree"]["children"]]
+        self.assertNotIn("@drop", names)
+        for bad in (lambda: lib.create_folder("", "@drop"), lambda: lib.rename_folder("@drop", "x"),
+                    lambda: lib.delete_folder("@drop"), lambda: lib.resolve("@drop/../x")):
+            with self.assertRaises(lib.LibraryError):
+                bad()
+        try:
+            from cast_library.node import CastLibraryLoadImage
+        except Exception as e:
+            self.skipTest(f"node import failed: {e}")
+        img, mask, w, h, fname, folder, folder_name = CastLibraryLoadImage().load_image(
+            a, False, 512, 512, False, 32, "lanczos")
+        self.assertEqual((w, h, folder, folder_name), (64, 48, "", ""))
+        self.assertTrue(fname.startswith("photo_"))
+
     def test_paint_goes_into_output_image(self):
         try:
             from cast_library.node import CastLibraryLoadImage

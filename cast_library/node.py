@@ -25,7 +25,8 @@ the library stays untouched.
 
 With compose on, the node instead outputs a composition of several library
 images (arranged like "Stitch Images" or freely placed, cropped and scaled in
-the composer window); its longest side is at most MAX_SIDE and the mask is empty.
+the composer window), optionally painted over with solid colours; its longest
+side is at most MAX_SIDE and the mask is empty.
 
 Resize and mask logic is taken from "Load & Resize Image + Filename"
 (Slartibart23), which is based on KJNodes LoadAndResizeImage by kijai
@@ -40,7 +41,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 from comfy.utils import common_upscale
 
@@ -335,7 +336,68 @@ class CastLibraryLoadImage:
                 continue
             img = img.resize((w, h), Image.Resampling.LANCZOS)
             out.paste(img, (round(float(layer["x"]) * scale), round(float(layer["y"]) * scale)), img)
-        return cls._pil_to_tensor(out.convert("RGB")), [l["path"] for l in layers]
+
+        image = np.asarray(out.convert("RGB"), dtype=np.float32) / 255.0
+        image = cls._apply_paint(image, data.get("paint") or [], scale)
+        return torch.from_numpy(image).unsqueeze(0), [l["path"] for l in layers]
+
+    @staticmethod
+    def _apply_paint(image: np.ndarray, strokes, scale: float) -> np.ndarray:
+        """
+        Paint the composer's colour strokes over the image (H, W, 3 floats).
+        A stroke: t brush | lasso | erase, c colour '#rrggbb', o opacity, s size and
+        p points in canvas pixels, h hardness (1 = hard edge, lower = blurred edge).
+        The strokes form one layer above the images; erase only removes paint.
+        """
+        if not strokes:
+            return image
+        h_img, w_img = image.shape[:2]
+        pm = np.zeros_like(image)                      # premultiplied paint colour
+        pa = np.zeros((h_img, w_img, 1), np.float32)   # paint alpha
+        for st in strokes:
+            if not isinstance(st, dict) or not st.get("p"):
+                continue
+            kind = st.get("t", "brush")
+            size = max(1.0, float(st.get("s", 20)) * scale)
+            blur = (1.0 - min(max(float(st.get("h", 1.0)), 0.0), 1.0)) * size * 0.25
+            pts = [(float(p[0]) * scale, float(p[1]) * scale) for p in st["p"] if len(p) >= 2]
+            if not pts or (kind == "lasso" and len(pts) < 3):
+                continue
+            # work on the stroke's bounding box only
+            pad = size / 2 + 3 * blur + 2
+            x0 = max(0, int(min(p[0] for p in pts) - pad))
+            y0 = max(0, int(min(p[1] for p in pts) - pad))
+            x1 = min(w_img, int(max(p[0] for p in pts) + pad) + 1)
+            y1 = min(h_img, int(max(p[1] for p in pts) + pad) + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            region = Image.new("L", (x1 - x0, y1 - y0), 0)
+            draw = ImageDraw.Draw(region)
+            local = [(x - x0, y - y0) for x, y in pts]
+            if kind == "lasso":
+                draw.polygon(local, fill=255)
+            else:
+                r = size / 2
+                if len(local) > 1:
+                    draw.line(local, fill=255, width=int(round(size)))
+                for x, y in local:
+                    draw.ellipse((x - r, y - r, x + r, y + r), fill=255)
+            if blur > 0.3:
+                region = region.filter(ImageFilter.GaussianBlur(blur))
+            a = np.asarray(region, np.float32)[..., None] / 255.0 * min(max(float(st.get("o", 1.0)), 0.0), 1.0)
+            sl = (slice(y0, y1), slice(x0, x1))
+            if kind == "erase":
+                pm[sl] *= 1.0 - a
+                pa[sl] *= 1.0 - a
+            else:
+                c = str(st.get("c") or "#000000").lstrip("#")
+                try:
+                    color = np.array([int(c[i:i + 2], 16) for i in (0, 2, 4)], np.float32) / 255.0
+                except ValueError:
+                    color = np.zeros(3, np.float32)
+                pm[sl] = pm[sl] * (1.0 - a) + color * a
+                pa[sl] = pa[sl] * (1.0 - a) + a
+        return image * (1.0 - pa) + pm
 
     # ------------------------------------------------------------------
     # main

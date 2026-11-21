@@ -49,6 +49,10 @@ THUMB_DIR = ".thumbs"
 TRASH_DIR = ".trash"  # deleted files on systems without a reachable recycle bin
 THUMB_SIZE = 320
 MASK_EDITOR_SUBFOLDER = "cast_library"
+# images dropped on a node without saving them in the library live in
+# input/cast_library_drops and are addressed as "@drop/<file>"
+DROP_PREFIX = "@drop"
+DROPS_SUBFOLDER = "cast_library_drops"
 
 _INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _CLIPSPACE_PAINTED = re.compile(r"^clipspace-painted-masked-(\d+)\.png$")
@@ -100,20 +104,47 @@ def clean_rel(rel: str) -> str:
     return "/".join(parts)
 
 
+def drops_dir() -> str:
+    import folder_paths
+    return os.path.join(folder_paths.get_input_directory(), DROPS_SUBFOLDER)
+
+
+def _inside(base: str, full: str) -> bool:
+    try:
+        return os.path.commonpath([base, full]) == base
+    except ValueError:  # other drive
+        return False
+
+
 def resolve(rel: str) -> str:
-    """Absolute path for a relative library path; never leaves the root."""
-    root = os.path.abspath(ensure_root())
+    """Absolute path for a relative library path ('@drop/...' = dropped images); never leaves its base."""
     rel = clean_rel(rel)
-    full = os.path.abspath(os.path.join(root, *rel.split("/"))) if rel else root
-    if os.path.commonpath([root, full]) != root:
+    head, _, rest = rel.partition("/")
+    if head == DROP_PREFIX:
+        base, rel = os.path.abspath(drops_dir()), rest
+        os.makedirs(base, exist_ok=True)
+    else:
+        base = os.path.abspath(ensure_root())
+    full = os.path.abspath(os.path.join(base, *rel.split("/"))) if rel else base
+    if not _inside(base, full):
         raise LibraryError(f"Invalid library path: {rel!r}")
     return full
 
 
 def to_rel(full: str) -> str:
+    full = os.path.abspath(full)
     root = os.path.abspath(root_dir())
-    rel = os.path.relpath(os.path.abspath(full), root).replace("\\", "/")
+    if not _inside(root, full):
+        drops = os.path.abspath(drops_dir())
+        if _inside(drops, full):
+            rel = os.path.relpath(full, drops).replace("\\", "/")
+            return DROP_PREFIX if rel == "." else f"{DROP_PREFIX}/{rel}"
+    rel = os.path.relpath(full, root).replace("\\", "/")
     return "" if rel == "." else rel
+
+
+def is_dropped(rel: str) -> bool:
+    return clean_rel(rel).partition("/")[0] == DROP_PREFIX
 
 
 def is_image_name(name: str) -> bool:
@@ -147,6 +178,8 @@ def check_name(name: str) -> str:
         raise LibraryError(f'"{name}" is not a valid folder name (not allowed: < > : " / \\ | ? * and a leading or trailing dot).')
     if len(name) > 80:
         raise LibraryError("The name is too long (max. 80 characters).")
+    if name.lower() == DROP_PREFIX:
+        raise LibraryError(f'"{DROP_PREFIX}" is reserved for dropped images.')
     return name
 
 
@@ -167,7 +200,9 @@ def folder_dir(rel: str) -> str:
 
 
 def describe(rel: str) -> Tuple[str, str]:
-    """(folder path, folder name) of an image, e.g. ('PERSONS/Anna/Face', 'Face')."""
+    """(folder path, folder name) of an image, e.g. ('PERSONS/Anna/Face', 'Face'); dropped images: ('', '')."""
+    if is_dropped(rel):
+        return "", ""
     folder = clean_rel(rel).rpartition("/")[0]
     return folder, folder.rpartition("/")[2]
 
@@ -290,7 +325,7 @@ def create_folder(parent_rel: str, name: str) -> str:
 
 
 def _existing_folder(rel: str) -> str:
-    if not clean_rel(rel):
+    if not clean_rel(rel) or is_dropped(rel):
         raise LibraryError("The library root itself cannot be changed.")
     return folder_dir(rel)
 
@@ -370,7 +405,13 @@ def save_upload(dir_rel: str, filename: str, data: bytes) -> str:
             im.verify()
     except Exception:
         raise LibraryError(f"The file is not a readable image: {base!r}") from None
-    target = os.path.join(folder, _free_name(folder, stem, ext) + ext)
+    if is_dropped(dir_rel):
+        # named by content: dropping the same image again reuses the file
+        target = os.path.join(folder, f"{stem}_{hashlib.sha1(data).hexdigest()[:10]}{ext}")
+        if os.path.isfile(target):
+            return to_rel(target)
+    else:
+        target = os.path.join(folder, _free_name(folder, stem, ext) + ext)
     with open(target, "wb") as f:
         f.write(data)
     return to_rel(target)
